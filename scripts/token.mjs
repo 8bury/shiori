@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Gets an OAuth access token for /mcp through the real sign-in flow, for scripts like measure.py.
-// Approve once: the client id and refresh token stay in the macOS Keychain (service "second-brain-cli").
+// Approve once: the client id and refresh token stay in the macOS Keychain (service "shiori-cli").
 // Later runs reuse the access token while it lasts (1 h) or refresh it (grant lives 30 days without use),
 // and open the browser only when both fail. Prints ONLY the token on stdout, so it can go into a variable:
 //   export ACCESS_TOKEN=$(node scripts/token.mjs) && python3 scripts/measure.py 10
@@ -12,7 +12,7 @@ const BASE = process.env.SECOND_BRAIN_URL || execFileSync("node", ["scripts/conf
 const b64url = (b) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const log = (m) => process.stderr.write(m + "\n");
 
-const KC = "second-brain-cli";
+const KC = "shiori-cli";
 const kcRead = () => { try { return JSON.parse(execFileSync("security", ["find-generic-password", "-s", KC, "-w"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })); } catch { return null; } };
 const kcWrite = (v) => execFileSync("security", ["add-generic-password", "-U", "-s", KC, "-a", process.env.USER || "me", "-w", JSON.stringify(v)]);
 const save = (client_id, t) => kcWrite({ base: BASE, client_id, access_token: t.access_token, refresh_token: t.refresh_token, expires_at: Date.now() + (t.expires_in ?? 3600) * 1000 });

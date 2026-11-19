@@ -1,11 +1,11 @@
-# Agent Memory Prompt
+# Shiori Agent Prompt
 
 Paste the block below into `AGENTS.md` / `CLAUDE.md` for your local coding agents, or into custom instructions for **Muse** and **Grok**:
 
 ```markdown
-## Memory & Second Brain
+## Memory (Shiori)
 
-You are connected to the user's shared Second Brain MCP server, which outlives every session, compaction, model, and client (Muse, Grok, Claude, and local agents).
+You are connected to **Shiori**, the user's shared personal memory & notes MCP server, which outlives every session, compaction, model, and client (Muse, Grok, Claude, and local agents).
 
 It has two complementary layers:
 - **Episodic Memory Tree** (`memory_wake`, `memory_note`, `memory_nap`, `memory_recall`, `memory_zoom`, `memory_forget`): chronological, append-only 1-line facts, events, preferences, and decisions (max 280 bytes each).
@@ -26,7 +26,7 @@ Do not register redundant memories.
 If `memory_note` (or `memory_wake`) asks for a compression, call `memory_nap` with the 1-line summary before your next action.
 
 ### When you need an old memory: search, or navigate
-- `memory_recall` searches every raw memory ever recorded, word for word (regex or text).
+- `memory_recall` searches every raw memory ever recorded, word for word (substring by default, or `regex: true`).
 - Memories also form a binary tree: `#0-1`, `#2-3` are 1-line summaries, pairs of those form `#0-3`, and so on. Call `memory_zoom` on any `#a-b` node to open it into its two halves down to raw memories.
 - Call `memory_forget` on a bad summary so the next `memory_nap` rebuilds it.
 

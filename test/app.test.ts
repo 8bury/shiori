@@ -50,10 +50,10 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
   beforeEach(async () => {
     githubUserId = 42;
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-mcp-test-"));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shiori-test-"));
     const config = loadConfig({
       DATA_DIR: tmpDir,
-      PUBLIC_URL: "https://brain.example.com",
+      PUBLIC_URL: "https://shiori.example.com",
       GITHUB_CLIENT_ID: "gh-client",
       GITHUB_CLIENT_SECRET: "gh-secret",
       OWNER_GITHUB_ID: "42",
@@ -75,7 +75,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
   async function obtainToken(redirectUri = "http://127.0.0.1:4321/cb") {
     // 1. Dynamic client registration
     const reg = await app.fetch(
-      new Request("https://brain.example.com/register", {
+      new Request("https://shiori.example.com/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ client_name: "Test Client", redirect_uris: [redirectUri] }),
@@ -86,7 +86,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // 2. GET /authorize -> consent page
     const verifier = "my-super-secret-pkce-verifier-string-1234567890";
-    const authUrl = new URL("https://brain.example.com/authorize");
+    const authUrl = new URL("https://shiori.example.com/authorize");
     authUrl.searchParams.set("client_id", client_id);
     authUrl.searchParams.set("redirect_uri", redirectUri);
     authUrl.searchParams.set("response_type", "code");
@@ -105,7 +105,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     // 3. POST /authorize -> redirect to GitHub
     const form = new URLSearchParams({ handle: handleMatch![1], decision: "approve" });
     const approveRes = await app.fetch(
-      new Request("https://brain.example.com/authorize", {
+      new Request("https://shiori.example.com/authorize", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: consentCookie },
         body: form,
@@ -119,7 +119,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // 4. GET /callback -> redirect back to client with code
     const cbRes = await app.fetch(
-      new Request(`https://brain.example.com/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, {
+      new Request(`https://shiori.example.com/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, {
         headers: { Cookie: ghCookie },
       }),
     );
@@ -130,7 +130,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // 5. POST /token -> access + refresh tokens
     const tokRes = await app.fetch(
-      new Request("https://brain.example.com/token", {
+      new Request("https://shiori.example.com/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -149,7 +149,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
   async function mcpCall(token: string, name: string, args: Record<string, unknown> = {}) {
     const res = await app.fetch(
-      new Request("https://brain.example.com/mcp", {
+      new Request("https://shiori.example.com/mcp", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -179,15 +179,15 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
   }
 
   it("exposes health and OAuth discovery metadata, and blocks unauthenticated /mcp", async () => {
-    const health = await app.fetch(new Request("https://brain.example.com/health"));
+    const health = await app.fetch(new Request("https://shiori.example.com/health"));
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({ ok: true });
 
-    const prm = await app.fetch(new Request("https://brain.example.com/.well-known/oauth-protected-resource"));
+    const prm = await app.fetch(new Request("https://shiori.example.com/.well-known/oauth-protected-resource"));
     expect(prm.status).toBe(200);
-    expect(await prm.json()).toMatchObject({ resource: "https://brain.example.com/mcp", authorization_servers: ["https://brain.example.com"] });
+    expect(await prm.json()).toMatchObject({ resource: "https://shiori.example.com/mcp", authorization_servers: ["https://shiori.example.com"] });
 
-    const unauth = await app.fetch(new Request("https://brain.example.com/mcp", { method: "POST" }));
+    const unauth = await app.fetch(new Request("https://shiori.example.com/mcp", { method: "POST" }));
     expect(unauth.status).toBe(401);
     expect(unauth.headers.get("www-authenticate")).toContain("resource_metadata=");
   });
@@ -195,7 +195,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
   it("enforces redirect allowlist (including custom ALLOWED_REDIRECT_PREFIXES) and owner GitHub ID", async () => {
     // Disallowed redirect gets 403
     const regBad = await app.fetch(
-      new Request("https://brain.example.com/register", {
+      new Request("https://shiori.example.com/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ client_name: "Evil", redirect_uris: ["https://evil.example.com/cb"] }),
@@ -204,7 +204,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     const { client_id: evilId } = (await regBad.json()) as { client_id: string };
     const badAuth = await app.fetch(
       new Request(
-        `https://brain.example.com/authorize?client_id=${evilId}&redirect_uri=https://evil.example.com/cb&response_type=code&code_challenge=abc&code_challenge_method=S256`,
+        `https://shiori.example.com/authorize?client_id=${evilId}&redirect_uri=https://evil.example.com/cb&response_type=code&code_challenge=abc&code_challenge_method=S256`,
       ),
     );
     expect(badAuth.status).toBe(403);
@@ -216,7 +216,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     // Wrong GitHub owner is rejected at /callback
     githubUserId = 999;
     const reg = await app.fetch(
-      new Request("https://brain.example.com/register", {
+      new Request("https://shiori.example.com/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ client_name: "Other", redirect_uris: ["http://127.0.0.1:9999/cb"] }),
@@ -225,12 +225,12 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     const { client_id } = (await reg.json()) as { client_id: string };
     const cRes = await app.fetch(
       new Request(
-        `https://brain.example.com/authorize?client_id=${client_id}&redirect_uri=http://127.0.0.1:9999/cb&response_type=code&code_challenge=${s256("v")}&code_challenge_method=S256`,
+        `https://shiori.example.com/authorize?client_id=${client_id}&redirect_uri=http://127.0.0.1:9999/cb&response_type=code&code_challenge=${s256("v")}&code_challenge_method=S256`,
       ),
     );
     const handle = (await cRes.text()).match(/name="handle" value="([^"]+)"/)![1];
     const aRes = await app.fetch(
-      new Request("https://brain.example.com/authorize", {
+      new Request("https://shiori.example.com/authorize", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: extractCookie(cRes) },
         body: new URLSearchParams({ handle, decision: "approve" }),
@@ -238,7 +238,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     );
     const ghState = new URL(aRes.headers.get("location")!).searchParams.get("state")!;
     const cbRes = await app.fetch(
-      new Request(`https://brain.example.com/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, {
+      new Request(`https://shiori.example.com/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, {
         headers: { Cookie: extractCookie(aRes) },
       }),
     );
@@ -301,7 +301,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // Refresh token rotation
     const refRes = await app.fetch(
-      new Request("https://brain.example.com/token", {
+      new Request("https://shiori.example.com/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ grant_type: "refresh_token", refresh_token, client_id: clientId }),
@@ -313,14 +313,14 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // Admin grants list + revoke
     const grantsRes = await app.fetch(
-      new Request("https://brain.example.com/admin/grants", { headers: { Authorization: "Bearer super-secret-admin" } }),
+      new Request("https://shiori.example.com/admin/grants", { headers: { Authorization: "Bearer super-secret-admin" } }),
     );
     expect(grantsRes.status).toBe(200);
     const grants = (await grantsRes.json()) as { id: string }[];
     expect(grants).toHaveLength(1);
 
     const revRes = await app.fetch(
-      new Request(`https://brain.example.com/admin/grants/${grants[0].id}`, {
+      new Request(`https://shiori.example.com/admin/grants/${grants[0].id}`, {
         method: "DELETE",
         headers: { Authorization: "Bearer super-secret-admin" },
       }),
@@ -329,7 +329,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // Revoking an already-deleted/missing grant returns 404 (L5)
     const revMissing = await app.fetch(
-      new Request(`https://brain.example.com/admin/grants/${grants[0].id}`, {
+      new Request(`https://shiori.example.com/admin/grants/${grants[0].id}`, {
         method: "DELETE",
         headers: { Authorization: "Bearer super-secret-admin" },
       }),
@@ -338,7 +338,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
 
     // Revoked token is immediately rejected
     const afterRevoke = await app.fetch(
-      new Request("https://brain.example.com/mcp", {
+      new Request("https://shiori.example.com/mcp", {
         method: "POST",
         headers: { Authorization: `Bearer ${rotated.access_token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),

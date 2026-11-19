@@ -60,7 +60,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       manifest,
       keywords,
       enqueue: (msgs, delay): Promise<void> => queue.enqueue(msgs, delay),
-      repoName: config.brainName,
+      repoName: config.serverName,
     }),
     alerts,
     options.queueDelayMultiplier ?? 1000,
@@ -101,7 +101,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
 
   function createServer() {
     const server = new McpServer(
-      { name: config.brainName, version: "0.4.0" },
+      { name: config.serverName, version: "0.4.0" },
       { instructions: MEMORY_INSTRUCTIONS },
     );
 
@@ -169,7 +169,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     server.registerTool(
       "list_notes",
       {
-        description: `Lists the notes in your second brain (Markdown file paths, e.g. ${config.ideasDir}/..., projects/..., decisions/...).`,
+        description: `Lists the notes in Shiori (Markdown file paths, e.g. ${config.ideasDir}/..., projects/..., decisions/...).`,
         inputSchema: { prefix: z.string().optional() },
       },
       async ({ prefix }) => text((await notesSource.listNotes(prefix ?? "")).join("\n") || "No notes."),

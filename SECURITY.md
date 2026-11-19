@@ -12,4 +12,4 @@ What it does not do yet: authorization per note. Anyone who signs in sees every 
 
 ## Reporting a vulnerability
 
-Please use [GitHub private vulnerability reporting](https://github.com/YudiG12/second-brain-mcp/security/advisories/new) instead of a public issue.
+Please use [GitHub private vulnerability reporting](https://github.com/8bury/shiori/security/advisories/new) instead of a public issue.

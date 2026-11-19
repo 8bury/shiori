@@ -78,7 +78,7 @@ describe("MemoryStore", () => {
   let logPath: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-mem-test-"));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shiori-mem-test-"));
     logPath = path.join(tmpDir, "LOG.txt");
     db = openDatabase(":memory:");
     store = new MemoryStore(db, 4, logPath);

@@ -58,8 +58,8 @@ export class LocalGitWorkingCopy implements WorkingCopy {
 
   constructor(
     private readonly dir: string,
-    private readonly authorName = "Second Brain",
-    private readonly authorEmail = "brain@localhost",
+    private readonly authorName = "Shiori",
+    private readonly authorEmail = "shiori@localhost",
     private readonly remoteUrl = "",
   ) {}
 

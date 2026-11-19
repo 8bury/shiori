@@ -140,7 +140,7 @@ function parseCookies(req: Request): Map<string, string> {
 }
 
 function cookieName(publicUrl: string): string {
-  return publicUrl.startsWith("https://") ? "__Host-sb_oauth" : "sb_oauth";
+  return publicUrl.startsWith("https://") ? "__Host-shiori_oauth" : "shiori_oauth";
 }
 
 function setCookieHeader(publicUrl: string, value: string, maxAge: number): string {
@@ -162,7 +162,7 @@ function consentPage(req: AuthRequestPayload, handle: string): string {
   const isLoopback = LOOPBACK.has(redirectUrl.hostname);
   const who = req.clientDomain ? `Published by <strong>${escapeHtml(req.clientDomain)}</strong>.` : "This app registered itself; its name is not verified.";
   return `<title>Connect ${escapeHtml(req.clientName)}</title>
-<h1>Connect ${escapeHtml(req.clientName)} to your second brain?</h1>
+<h1>Connect ${escapeHtml(req.clientName)} to Shiori?</h1>
 <p>${who} Access to your notes will be sent to <strong>${escapeHtml(redirectUrl.host)}</strong>.</p>
 ${isLoopback ? "<p><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</p>" : ""}
 <p>Next, you'll sign in with GitHub to prove it's you.</p>
@@ -360,7 +360,7 @@ export class OAuthServer {
       if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) return null;
 
       const res = await this.fetcher(clientId, {
-        headers: { Accept: "application/json", "User-Agent": "second-brain-mcp" },
+        headers: { Accept: "application/json", "User-Agent": "shiori" },
         redirect: "error",
         signal: AbortSignal.timeout(5000),
       });
@@ -536,7 +536,7 @@ export class OAuthServer {
       headers: {
         Authorization: `Bearer ${tokenJson.access_token}`,
         Accept: "application/vnd.github+json",
-        "User-Agent": "second-brain-mcp",
+        "User-Agent": "shiori",
       },
       signal: AbortSignal.timeout(10_000),
     });
@@ -544,7 +544,7 @@ export class OAuthServer {
     if (!user) return plain("Couldn't read your GitHub account. Start again from your app.", 502);
     if (String(user.id) !== this.config.ownerGithubId) {
       console.warn(JSON.stringify({ auth: "refused", githubId: user.id }));
-      return plain("This second brain belongs to someone else.", 403);
+      return plain("This Shiori instance belongs to someone else.", 403);
     }
 
     const authCode = randomToken(32);

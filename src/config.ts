@@ -9,7 +9,7 @@ export interface AppConfig {
   notesDir: string;
   dbPath: string;
   publicUrl: string;
-  brainName: string;
+  serverName: string;
   ideasDir: string;
   timezone: string;
   memoryWakeLines: number;
@@ -62,9 +62,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     host: env.HOST?.trim() || "0.0.0.0",
     dataDir,
     notesDir: path.join(dataDir, "notes"),
-    dbPath: path.join(dataDir, "brain.db"),
+    dbPath: path.join(dataDir, "shiori.db"),
     publicUrl: (env.PUBLIC_URL?.trim() || `http://localhost:${env.PORT || 3000}`).replace(/\/+$/, ""),
-    brainName: env.BRAIN_NAME?.trim() || "second-brain",
+    serverName: env.SERVER_NAME?.trim() || env.BRAIN_NAME?.trim() || "shiori",
     ideasDir: (env.IDEAS_DIR?.trim() || "ideas").replace(/^\/+|\/+$/g, ""),
     timezone: env.TIMEZONE?.trim() || "America/Sao_Paulo",
     memoryWakeLines: Math.max(8, Number(env.MEMORY_WAKE_LINES || 96) || 96),
@@ -79,7 +79,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     embeddingModel: env.EMBEDDING_MODEL?.trim() || defaultModel,
     embeddingBaseUrl: (env.EMBEDDING_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""),
     gitRemoteUrl: env.GIT_REMOTE_URL?.trim() || "",
-    gitAuthorName: env.GIT_AUTHOR_NAME?.trim() || "Second Brain",
-    gitAuthorEmail: env.GIT_AUTHOR_EMAIL?.trim() || "brain@localhost",
+    gitAuthorName: env.GIT_AUTHOR_NAME?.trim() || "Shiori",
+    gitAuthorEmail: env.GIT_AUTHOR_EMAIL?.trim() || "shiori@localhost",
   };
 }
