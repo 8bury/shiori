@@ -1,5 +1,5 @@
-import type { Change, Operation, WorkingCopy, WriteResult } from "./types";
-import { noteVersion } from "./version";
+import type { Change, Operation, WorkingCopy, WriteResult } from "./types.js";
+import { noteVersion } from "./version.js";
 
 const MAX_ATTEMPTS = 3; // pushes before giving up as busy (spec v2 §5.1)
 

@@ -1,7 +1,6 @@
-import { applyD1Migrations, type D1Migration } from "cloudflare:test";
-import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildFtsQuery, fuse, semanticHits, type Hit } from "../src/search/hybrid";
+import { openDatabase } from "../src/storage/db";
 
 describe("buildFtsQuery", () => {
   it("quotes each word as a prefix and joins with OR", () => {
@@ -72,26 +71,25 @@ describe("fuse (reciprocal rank fusion)", () => {
   });
 });
 
-describe("chunks_fts on real local D1", () => {
-  const db = (env as any).DB as D1Database;
-  beforeAll(async () => {
-    await applyD1Migrations(db, (env as any).TEST_MIGRATIONS as D1Migration[]);
-    await db.batch([
-      db.prepare("INSERT INTO chunks_fts (path, seq, text) VALUES (?, 0, ?)").bind("a.md", "A decisão sobre a Acmecorp e o café"),
-      db.prepare("INSERT INTO chunks_fts (path, seq, text) VALUES (?, 0, ?)").bind("b.md", "Notes about cooking"),
-    ]);
+describe("chunks_fts on real local SQLite", () => {
+  const db = openDatabase(":memory:");
+  beforeAll(() => {
+    db.prepare("INSERT INTO chunks_fts (path, seq, text) VALUES (?, 0, ?)").run("a.md", "A decisão sobre a Acmecorp e o café");
+    db.prepare("INSERT INTO chunks_fts (path, seq, text) VALUES (?, 0, ?)").run("b.md", "Notes about cooking");
   });
-  const match = async (q: string) => (await db.prepare("SELECT path FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts)").bind(q).all<{ path: string }>()).results.map((r) => r.path);
+  afterAll(() => db.close());
+  const match = (q: string) =>
+    (db.prepare("SELECT path FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts)").all(q) as { path: string }[]).map((r) => r.path);
 
-  it("ignores accents and case", async () => {
-    expect(await match(buildFtsQuery("DECISAO")!)).toEqual(["a.md"]);
-  });
-
-  it("matches word prefixes", async () => {
-    expect(await match(buildFtsQuery("acme")!)).toEqual(["a.md"]);
+  it("ignores accents and case", () => {
+    expect(match(buildFtsQuery("DECISAO")!)).toEqual(["a.md"]);
   });
 
-  it("finds either word with OR", async () => {
-    expect((await match(buildFtsQuery("acmecorp cooking")!)).sort()).toEqual(["a.md", "b.md"]);
+  it("matches word prefixes", () => {
+    expect(match(buildFtsQuery("acme")!)).toEqual(["a.md"]);
+  });
+
+  it("finds either word with OR", () => {
+    expect(match(buildFtsQuery("acmecorp cooking")!).sort()).toEqual(["a.md", "b.md"]);
   });
 });

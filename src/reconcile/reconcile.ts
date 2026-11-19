@@ -1,6 +1,6 @@
-import type { IndexMessage } from "../indexer/types";
-import type { DropMessage, Mode, NoteSha, ReconcileDeps, Report, Step } from "./types";
-import { ALERT_ABOVE, BATCH } from "./types";
+import type { IndexMessage } from "../indexer/types.js";
+import type { DropMessage, Mode, NoteSha, ReconcileDeps, Report, Step } from "./types.js";
+import { ALERT_ABOVE, BATCH } from "./types.js";
 
 /**
  * Compares the notes with the index and enqueues what needs fixing. Each phase is a Workflow step,

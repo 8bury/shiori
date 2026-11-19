@@ -1,6 +1,6 @@
-import { chunk, idsFrom, MAX_CHUNKS, pathHash } from "../lib/notes";
-import type { Deps, IndexMessage, Outcome, PushedEvent, QueueMessage } from "./types";
-import { ZERO_SHA } from "./types";
+import { chunk, idsFrom, MAX_CHUNKS, pathHash } from "../lib/notes.js";
+import type { Deps, IndexMessage, Outcome, PushedEvent, QueueMessage } from "./types.js";
+import { ZERO_SHA } from "./types.js";
 
 const BRANCH_REF = "refs/heads/main";
 const MAX_REQUEUES = 5; // a note that keeps changing during indexing goes to retries, then the dead-letter queue

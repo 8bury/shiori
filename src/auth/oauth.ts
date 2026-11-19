@@ -1,0 +1,674 @@
+import crypto from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+import type { AppConfig } from "../config.js";
+
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const SESSION_TTL_SEC = 600; // 10 minutes
+const AUTH_CODE_TTL_SEC = 300; // 5 minutes
+const ACCESS_TOKEN_TTL_SEC = 3600; // 1 hour
+const REFRESH_TOKEN_IDLE_TTL_SEC = 30 * 24 * 3600; // 30 days
+
+export interface VerifiedToken {
+  token: string;
+  clientId: string;
+  userId: string;
+  scopes: string[];
+  expiresAt: number;
+  resource?: string;
+}
+
+interface ClientRecord {
+  clientId: string;
+  clientName: string;
+  clientDomain?: string;
+  redirectUris: string[];
+  tokenEndpointAuthMethod: string;
+  clientSecretHash: string | null;
+}
+
+interface AuthRequestPayload {
+  clientId: string;
+  clientName: string;
+  clientDomain?: string;
+  redirectUri: string;
+  state: string | null;
+  scope: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  resource: string | null;
+  githubVerifier?: string;
+}
+
+export function redirectAllowed(uri: string, allowedPrefixes: string[], allowAllHttps = false): boolean {
+  let u: URL;
+  try {
+    u = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (LOOPBACK.has(u.hostname)) return true;
+  if (allowAllHttps && u.protocol === "https:") return true;
+  const normalized = `${u.origin}${u.pathname}`;
+  return allowedPrefixes.some((p) => normalized.startsWith(p));
+}
+
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function s256(verifier: string): string {
+  return crypto.createHash("sha256").update(verifier).digest("base64url");
+}
+
+function randomToken(bytes = 32): string {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+function escapeHtml(v: string): string {
+  return v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function htmlResponse(body: string, headers: Headers, status = 200): Response {
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", "no-store");
+  headers.set("X-Frame-Options", "DENY");
+  return new Response(
+    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}button{font-size:1rem;padding:.5rem 1rem;margin-right:.5rem;cursor:pointer}</style>${body}`,
+    { status, headers },
+  );
+}
+
+function plain(message: string, status = 400): Response {
+  return new Response(message, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+}
+
+function jsonError(error: string, description: string, status = 400): Response {
+  return Response.json({ error, error_description: description }, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+function parseCookies(req: Request): Map<string, string> {
+  const map = new Map<string, string>();
+  const header = req.headers.get("cookie") ?? "";
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx > 0) {
+      map.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
+    }
+  }
+  return map;
+}
+
+function cookieName(publicUrl: string): string {
+  return publicUrl.startsWith("https://") ? "__Host-sb_oauth" : "sb_oauth";
+}
+
+function setCookieHeader(publicUrl: string, value: string, maxAge: number): string {
+  const name = cookieName(publicUrl);
+  const secure = publicUrl.startsWith("https://") ? "; Secure" : "";
+  return `${name}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
+}
+
+function redirectWithError(redirectUri: string, error: string, state: string | null, description?: string): Response {
+  const u = new URL(redirectUri);
+  u.searchParams.set("error", error);
+  if (description) u.searchParams.set("error_description", description);
+  if (state) u.searchParams.set("state", state);
+  return new Response(null, { status: 302, headers: { Location: u.toString(), "Cache-Control": "no-store" } });
+}
+
+function consentPage(req: AuthRequestPayload, handle: string): string {
+  const redirectUrl = new URL(req.redirectUri);
+  const isLoopback = LOOPBACK.has(redirectUrl.hostname);
+  const who = req.clientDomain ? `Published by <strong>${escapeHtml(req.clientDomain)}</strong>.` : "This app registered itself; its name is not verified.";
+  return `<title>Connect ${escapeHtml(req.clientName)}</title>
+<h1>Connect ${escapeHtml(req.clientName)} to your second brain?</h1>
+<p>${who} Access to your notes will be sent to <strong>${escapeHtml(redirectUrl.host)}</strong>.</p>
+${isLoopback ? "<p><strong>This sends access to an app on this computer.</strong> Continue only if you just started connecting from it.</p>" : ""}
+<p>Next, you'll sign in with GitHub to prove it's you.</p>
+<form method="post"><input type="hidden" name="handle" value="${escapeHtml(handle)}">
+<button name="decision" value="approve">Continue with GitHub</button><button name="decision" value="deny">Cancel</button></form>`;
+}
+
+export class OAuthServer {
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly config: Pick<
+      AppConfig,
+      "publicUrl" | "githubClientId" | "githubClientSecret" | "ownerGithubId" | "allowedRedirectPrefixes" | "allowAllHttpsRedirects"
+    >,
+    private readonly fetcher: typeof fetch = fetch,
+  ) {}
+
+  protectedResourceMetadata(): Response {
+    return Response.json(
+      {
+        resource: `${this.config.publicUrl}/mcp`,
+        authorization_servers: [this.config.publicUrl],
+        scopes_supported: ["mcp"],
+        bearer_methods_supported: ["header"],
+      },
+      { headers: { "Cache-Control": "public, max-age=300" } },
+    );
+  }
+
+  authorizationServerMetadata(): Response {
+    const base = this.config.publicUrl;
+    return Response.json(
+      {
+        issuer: base,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        registration_endpoint: `${base}/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
+        scopes_supported: ["mcp"],
+        client_id_metadata_document_supported: true,
+      },
+      { headers: { "Cache-Control": "public, max-age=300" } },
+    );
+  }
+
+  unauthorizedResponse(description?: string): Response {
+    const resourceMeta = `${this.config.publicUrl}/.well-known/oauth-protected-resource`;
+    const parts = [`Bearer resource_metadata="${resourceMeta}"`, `scope="mcp"`];
+    if (description) parts.push(`error="invalid_token"`, `error_description="${description.replace(/"/g, "'")}"`);
+    return new Response(JSON.stringify({ error: "unauthorized", error_description: description ?? "Authentication required" }), {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": parts.join(", "),
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  async register(req: Request): Promise<Response> {
+    if (req.method !== "POST") return plain("Method not allowed", 405);
+    let body: Record<string, unknown>;
+    try {
+      body = (await req.json()) as Record<string, unknown>;
+    } catch {
+      return jsonError("invalid_client_metadata", "Request body must be valid JSON");
+    }
+    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u): u is string => typeof u === "string") : [];
+    if (!redirectUris.length) {
+      return jsonError("invalid_redirect_uri", "redirect_uris must be a non-empty array of URLs");
+    }
+    for (const uri of redirectUris) {
+      try {
+        const u = new URL(uri);
+        if (u.protocol !== "https:" && !LOOPBACK.has(u.hostname)) {
+          return jsonError("invalid_redirect_uri", `Redirect URI must use https or loopback: ${uri}`);
+        }
+      } catch {
+        return jsonError("invalid_redirect_uri", `Invalid redirect URI: ${uri}`);
+      }
+    }
+    const clientName = typeof body.client_name === "string" && body.client_name.trim() ? body.client_name.trim().slice(0, 120) : "MCP Client";
+    const authMethod =
+      body.token_endpoint_auth_method === "client_secret_post" || body.token_endpoint_auth_method === "client_secret_basic"
+        ? body.token_endpoint_auth_method
+        : "none";
+    const clientId = `mcp_${randomToken(18)}`;
+    const clientSecret = authMethod === "none" ? undefined : randomToken(32);
+    const now = Math.floor(Date.now() / 1000);
+
+    this.db
+      .prepare(
+        "INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(clientId, clientSecret ? sha256Hex(clientSecret) : null, clientName, JSON.stringify(redirectUris), authMethod, now);
+
+    return Response.json(
+      {
+        client_id: clientId,
+        ...(clientSecret ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
+        client_id_issued_at: now,
+        client_name: clientName,
+        redirect_uris: redirectUris,
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: authMethod,
+      },
+      { status: 201, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  private async resolveClient(clientId: string): Promise<ClientRecord | null> {
+    const row = this.db
+      .prepare("SELECT client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method FROM oauth_clients WHERE client_id = ?")
+      .get(clientId) as
+      | {
+          client_id: string;
+          client_secret_hash: string | null;
+          client_name: string;
+          redirect_uris: string;
+          token_endpoint_auth_method: string;
+        }
+      | undefined;
+
+    if (row) {
+      return {
+        clientId: row.client_id,
+        clientName: row.client_name,
+        redirectUris: JSON.parse(row.redirect_uris) as string[],
+        tokenEndpointAuthMethod: row.token_endpoint_auth_method,
+        clientSecretHash: row.client_secret_hash,
+      };
+    }
+
+    // Client ID Metadata Document (CIMD): https:// URL pointing to client metadata JSON
+    if (clientId.startsWith("https://")) {
+      try {
+        const u = new URL(clientId);
+        if (u.pathname === "/" || u.pathname === "") return null;
+        const res = await this.fetcher(clientId, {
+          headers: { Accept: "application/json", "User-Agent": "second-brain-mcp" },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!res.ok) return null;
+        const doc = (await res.json()) as { client_id?: string; client_name?: string; redirect_uris?: unknown };
+        if (doc.client_id !== clientId) return null;
+        const uris = Array.isArray(doc.redirect_uris) ? doc.redirect_uris.filter((x): x is string => typeof x === "string") : [];
+        if (!uris.length) return null;
+        return {
+          clientId,
+          clientName: typeof doc.client_name === "string" && doc.client_name.trim() ? doc.client_name.trim() : u.host,
+          clientDomain: u.host,
+          redirectUris: uris,
+          tokenEndpointAuthMethod: "none",
+          clientSecretHash: null,
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  async authorize(req: Request): Promise<Response> {
+    if (req.method === "GET") {
+      const url = new URL(req.url);
+      const clientId = url.searchParams.get("client_id") ?? "";
+      const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+      const responseType = url.searchParams.get("response_type") ?? "";
+      const state = url.searchParams.get("state");
+      const scope = url.searchParams.get("scope") ?? "mcp";
+      const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "";
+      const resource = url.searchParams.get("resource");
+
+      if (!clientId || !redirectUri) return plain("Missing client_id or redirect_uri", 400);
+      const client = await this.resolveClient(clientId);
+      if (!client) return plain("Unknown client_id", 400);
+      if (!client.redirectUris.includes(redirectUri)) return plain("redirect_uri is not registered for this client", 400);
+
+      if (!redirectAllowed(redirectUri, this.config.allowedRedirectPrefixes, this.config.allowAllHttpsRedirects)) {
+        console.warn(JSON.stringify({ auth: "redirect refused", redirectUri, clientId }));
+        return plain(`This server does not allow redirects to ${new URL(redirectUri).host}. Add it to ALLOWED_REDIRECT_PREFIXES to connect it.`, 403);
+      }
+
+      if (responseType !== "code") return redirectWithError(redirectUri, "unsupported_response_type", state);
+      if (!codeChallenge || codeChallengeMethod !== "S256") {
+        return redirectWithError(redirectUri, "invalid_request", state, "PKCE S256 is required");
+      }
+
+      const handle = randomToken(24);
+      const cookieVal = randomToken(24);
+      const now = Math.floor(Date.now() / 1000);
+      const payload: AuthRequestPayload = {
+        clientId: client.clientId,
+        clientName: client.clientName,
+        clientDomain: client.clientDomain,
+        redirectUri,
+        state,
+        scope,
+        codeChallenge,
+        codeChallengeMethod,
+        resource,
+      };
+      this.db
+        .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'consent', ?, ?, ?)")
+        .run(handle, sha256Hex(cookieVal), JSON.stringify(payload), now + SESSION_TTL_SEC);
+
+      const headers = new Headers();
+      headers.append("Set-Cookie", setCookieHeader(this.config.publicUrl, cookieVal, SESSION_TTL_SEC));
+      return htmlResponse(consentPage(payload, handle), headers);
+    }
+
+    if (req.method === "POST") {
+      const form = await req.formData();
+      const handle = String(form.get("handle") ?? "");
+      const decision = String(form.get("decision") ?? "");
+      const session = this.consumeSession(req, handle, "consent");
+      if (!session) return plain("This authorization session expired or was opened in another browser. Start again from your app.", 400);
+
+      if (decision !== "approve") {
+        const res = redirectWithError(session.redirectUri, "access_denied", session.state);
+        res.headers.append("Set-Cookie", setCookieHeader(this.config.publicUrl, "", 0));
+        return res;
+      }
+
+      if (!this.config.githubClientId || !this.config.githubClientSecret || !this.config.ownerGithubId) {
+        return plain("Server OAuth is not configured (missing GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, or OWNER_GITHUB_ID).", 500);
+      }
+
+      const ghState = randomToken(24);
+      const cookieVal = randomToken(24);
+      const verifier = randomToken(32);
+      const now = Math.floor(Date.now() / 1000);
+      const nextPayload: AuthRequestPayload = { ...session, githubVerifier: verifier };
+      this.db
+        .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'github', ?, ?, ?)")
+        .run(ghState, sha256Hex(cookieVal), JSON.stringify(nextPayload), now + SESSION_TTL_SEC);
+
+      const gh = new URL("https://github.com/login/oauth/authorize");
+      gh.search = new URLSearchParams({
+        client_id: this.config.githubClientId,
+        redirect_uri: `${this.config.publicUrl}/callback`,
+        state: ghState,
+        scope: "",
+        code_challenge: s256(verifier),
+        code_challenge_method: "S256",
+        allow_signup: "false",
+      }).toString();
+
+      const headers = new Headers({ Location: gh.toString(), "Cache-Control": "no-store" });
+      headers.append("Set-Cookie", setCookieHeader(this.config.publicUrl, cookieVal, SESSION_TTL_SEC));
+      return new Response(null, { status: 302, headers });
+    }
+
+    return plain("Method not allowed", 405);
+  }
+
+  async callback(req: Request): Promise<Response> {
+    if (req.method !== "GET") return plain("Method not allowed", 405);
+    const params = new URL(req.url).searchParams;
+    const ghState = params.get("state") ?? "";
+    const session = this.consumeSession(req, ghState, "github");
+    if (!session || !session.githubVerifier) {
+      return plain("This sign-in link expired or was opened in another browser. Start again from your app.", 400);
+    }
+
+    const clearCookie = setCookieHeader(this.config.publicUrl, "", 0);
+    const code = params.get("code");
+    if (params.get("error") || !code) {
+      const res = redirectWithError(session.redirectUri, "access_denied", session.state);
+      res.headers.append("Set-Cookie", clearCookie);
+      return res;
+    }
+
+    const tokenRes = await this.fetcher("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: this.config.githubClientId,
+        client_secret: this.config.githubClientSecret,
+        code,
+        redirect_uri: `${this.config.publicUrl}/callback`,
+        code_verifier: session.githubVerifier,
+      }),
+    });
+    const tokenJson = tokenRes.ok ? ((await tokenRes.json().catch(() => null)) as { access_token?: string; error?: string } | null) : null;
+    if (!tokenJson?.access_token) {
+      return plain(`GitHub sign-in failed (${tokenJson?.error ?? "no token"}). Start again from your app.`, 400);
+    }
+
+    const userRes = await this.fetcher("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${tokenJson.access_token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "second-brain-mcp",
+      },
+    });
+    const user = userRes.ok ? ((await userRes.json().catch(() => null)) as { id: number; login: string } | null) : null;
+    if (!user) return plain("Couldn't read your GitHub account. Start again from your app.", 502);
+    if (String(user.id) !== this.config.ownerGithubId) {
+      console.warn(JSON.stringify({ auth: "refused", githubId: user.id }));
+      return plain("This second brain belongs to someone else.", 403);
+    }
+
+    const authCode = randomToken(32);
+    const now = Math.floor(Date.now() / 1000);
+    this.db
+      .prepare(
+        "INSERT INTO oauth_auth_codes (code_hash, client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, resource, metadata, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        sha256Hex(authCode),
+        session.clientId,
+        String(user.id),
+        session.redirectUri,
+        session.scope,
+        session.codeChallenge,
+        session.codeChallengeMethod,
+        session.resource,
+        JSON.stringify({ login: user.login }),
+        now + AUTH_CODE_TTL_SEC,
+      );
+
+    const dest = new URL(session.redirectUri);
+    dest.searchParams.set("code", authCode);
+    if (session.state) dest.searchParams.set("state", session.state);
+
+    const headers = new Headers({ Location: dest.toString(), "Cache-Control": "no-store" });
+    headers.append("Set-Cookie", clearCookie);
+    return new Response(null, { status: 302, headers });
+  }
+
+  async token(req: Request): Promise<Response> {
+    if (req.method !== "POST") return plain("Method not allowed", 405);
+    const params = await this.parseTokenBody(req);
+    if (!params) return jsonError("invalid_request", "Could not parse token request body");
+
+    // Extract client credentials from Basic auth or form body
+    let clientId = params.get("client_id") ?? "";
+    let clientSecret = params.get("client_secret") ?? "";
+    const authHeader = req.headers.get("authorization") ?? "";
+    if (authHeader.startsWith("Basic ")) {
+      try {
+        const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+        const colon = decoded.indexOf(":");
+        if (colon > 0) {
+          clientId = decodeURIComponent(decoded.slice(0, colon));
+          clientSecret = decodeURIComponent(decoded.slice(colon + 1));
+        }
+      } catch {
+        return jsonError("invalid_client", "Invalid Basic authorization header", 401);
+      }
+    }
+
+    const grantType = params.get("grant_type");
+    if (grantType === "authorization_code") {
+      return this.exchangeAuthCode(params, clientId, clientSecret);
+    }
+    if (grantType === "refresh_token") {
+      return this.exchangeRefreshToken(params, clientId, clientSecret);
+    }
+    return jsonError("unsupported_grant_type", `Unsupported grant_type: ${grantType ?? ""}`);
+  }
+
+  private async verifyClientAuth(clientId: string, clientSecret: string): Promise<boolean> {
+    const client = await this.resolveClient(clientId);
+    if (!client) return false;
+    if (client.tokenEndpointAuthMethod === "none") return true;
+    if (!client.clientSecretHash || !clientSecret) return false;
+    const given = Buffer.from(sha256Hex(clientSecret), "hex");
+    const expected = Buffer.from(client.clientSecretHash, "hex");
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  }
+
+  private async exchangeAuthCode(params: URLSearchParams, clientId: string, clientSecret: string): Promise<Response> {
+    const code = params.get("code") ?? "";
+    const redirectUri = params.get("redirect_uri") ?? "";
+    const codeVerifier = params.get("code_verifier") ?? "";
+    if (!code || !codeVerifier) return jsonError("invalid_request", "Missing code or code_verifier");
+
+    const codeHash = sha256Hex(code);
+    const row = this.db
+      .prepare(
+        "SELECT client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, resource, metadata, expires_at FROM oauth_auth_codes WHERE code_hash = ?",
+      )
+      .get(codeHash) as
+      | {
+          client_id: string;
+          user_id: string;
+          redirect_uri: string;
+          scope: string;
+          code_challenge: string;
+          code_challenge_method: string;
+          resource: string | null;
+          metadata: string;
+          expires_at: number;
+        }
+      | undefined;
+
+    // Single-use: always delete immediately
+    this.db.prepare("DELETE FROM oauth_auth_codes WHERE code_hash = ?").run(codeHash);
+
+    const now = Math.floor(Date.now() / 1000);
+    if (!row || row.expires_at < now) return jsonError("invalid_grant", "Authorization code is invalid or expired");
+    if (clientId && clientId !== row.client_id) return jsonError("invalid_grant", "client_id mismatch");
+    const effectiveClientId = clientId || row.client_id;
+    if (!(await this.verifyClientAuth(effectiveClientId, clientSecret))) {
+      return jsonError("invalid_client", "Client authentication failed", 401);
+    }
+    if (redirectUri && redirectUri !== row.redirect_uri) return jsonError("invalid_grant", "redirect_uri mismatch");
+    if (row.code_challenge_method !== "S256" || s256(codeVerifier) !== row.code_challenge) {
+      return jsonError("invalid_grant", "Invalid PKCE code_verifier");
+    }
+
+    const grantId = randomToken(18);
+    this.db
+      .prepare(
+        "INSERT INTO oauth_grants (id, client_id, user_id, scope, metadata, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(grantId, row.client_id, row.user_id, row.scope, row.metadata, now, now, now + REFRESH_TOKEN_IDLE_TTL_SEC);
+
+    return this.issueTokens(grantId, row.client_id, row.user_id, row.scope, row.resource, now);
+  }
+
+  private async exchangeRefreshToken(params: URLSearchParams, clientId: string, clientSecret: string): Promise<Response> {
+    const refreshToken = params.get("refresh_token") ?? "";
+    if (!refreshToken) return jsonError("invalid_request", "Missing refresh_token");
+    const tokenHash = sha256Hex(refreshToken);
+
+    const row = this.db
+      .prepare("SELECT grant_id, client_id, user_id, scope, resource, expires_at FROM oauth_tokens WHERE token_hash = ? AND token_type = 'refresh'")
+      .get(tokenHash) as
+      | { grant_id: string; client_id: string; user_id: string; scope: string; resource: string | null; expires_at: number }
+      | undefined;
+
+    const now = Math.floor(Date.now() / 1000);
+    if (!row || row.expires_at < now) return jsonError("invalid_grant", "Refresh token is invalid or expired");
+    if (clientId && clientId !== row.client_id) return jsonError("invalid_grant", "client_id mismatch");
+    if (!(await this.verifyClientAuth(row.client_id, clientSecret))) {
+      return jsonError("invalid_client", "Client authentication failed", 401);
+    }
+
+    // Rotate refresh token and extend grant idle TTL
+    this.db.prepare("DELETE FROM oauth_tokens WHERE token_hash = ?").run(tokenHash);
+    this.db
+      .prepare("UPDATE oauth_grants SET last_used_at = ?, expires_at = ? WHERE id = ?")
+      .run(now, now + REFRESH_TOKEN_IDLE_TTL_SEC, row.grant_id);
+
+    return this.issueTokens(row.grant_id, row.client_id, row.user_id, row.scope, row.resource, now);
+  }
+
+  private issueTokens(grantId: string, clientId: string, userId: string, scope: string, resource: string | null, now: number): Response {
+    const accessToken = randomToken(32);
+    const refreshToken = randomToken(32);
+    const insert = this.db.prepare(
+      "INSERT INTO oauth_tokens (token_hash, grant_id, token_type, client_id, user_id, scope, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    insert.run(sha256Hex(accessToken), grantId, "access", clientId, userId, scope, resource, now + ACCESS_TOKEN_TTL_SEC);
+    insert.run(sha256Hex(refreshToken), grantId, "refresh", clientId, userId, scope, resource, now + REFRESH_TOKEN_IDLE_TTL_SEC);
+
+    return Response.json(
+      {
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: ACCESS_TOKEN_TTL_SEC,
+        refresh_token: refreshToken,
+        scope,
+      },
+      { headers: { "Cache-Control": "no-store", Pragma: "no-cache" } },
+    );
+  }
+
+  verifyBearer(req: Request): VerifiedToken | null {
+    const header = req.headers.get("authorization") ?? "";
+    if (!header.startsWith("Bearer ")) return null;
+    const token = header.slice(7).trim();
+    if (!token) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const row = this.db
+      .prepare("SELECT client_id, user_id, scope, resource, expires_at FROM oauth_tokens WHERE token_hash = ? AND token_type = 'access'")
+      .get(sha256Hex(token)) as
+      | { client_id: string; user_id: string; scope: string; resource: string | null; expires_at: number }
+      | undefined;
+    if (!row || row.expires_at <= now) return null;
+    return {
+      token,
+      clientId: row.client_id,
+      userId: row.user_id,
+      scopes: row.scope.split(/\s+/).filter(Boolean),
+      expiresAt: row.expires_at,
+      resource: row.resource ?? undefined,
+    };
+  }
+
+  listGrants(userId: string) {
+    return this.db
+      .prepare("SELECT id, client_id as clientId, scope, created_at as createdAt, last_used_at as lastUsedAt FROM oauth_grants WHERE user_id = ? ORDER BY created_at DESC")
+      .all(userId) as unknown as { id: string; clientId: string; scope: string; createdAt: number; lastUsedAt: number }[];
+  }
+
+  revokeGrant(grantId: string, userId: string): boolean {
+    const res = this.db.prepare("DELETE FROM oauth_grants WHERE id = ? AND user_id = ?").run(grantId, userId);
+    return Number(res.changes) > 0;
+  }
+
+  purgeExpired(): { sessions: number; codes: number; tokens: number; grants: number } {
+    const now = Math.floor(Date.now() / 1000);
+    const sessions = Number(this.db.prepare("DELETE FROM oauth_sessions WHERE expires_at < ?").run(now).changes);
+    const codes = Number(this.db.prepare("DELETE FROM oauth_auth_codes WHERE expires_at < ?").run(now).changes);
+    const tokens = Number(this.db.prepare("DELETE FROM oauth_tokens WHERE expires_at < ?").run(now).changes);
+    const grants = Number(this.db.prepare("DELETE FROM oauth_grants WHERE expires_at < ?").run(now).changes);
+    return { sessions, codes, tokens, grants };
+  }
+
+  private consumeSession(req: Request, handle: string, kind: "consent" | "github"): AuthRequestPayload | null {
+    if (!handle) return null;
+    const cookies = parseCookies(req);
+    const cookieVal = cookies.get(cookieName(this.config.publicUrl));
+    if (!cookieVal) return null;
+    const row = this.db
+      .prepare("SELECT cookie_hash, payload, expires_at FROM oauth_sessions WHERE handle = ? AND kind = ?")
+      .get(handle, kind) as { cookie_hash: string; payload: string; expires_at: number } | undefined;
+    this.db.prepare("DELETE FROM oauth_sessions WHERE handle = ?").run(handle);
+    const now = Math.floor(Date.now() / 1000);
+    if (!row || row.expires_at < now) return null;
+    const given = Buffer.from(sha256Hex(cookieVal), "hex");
+    const expected = Buffer.from(row.cookie_hash, "hex");
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+    return JSON.parse(row.payload) as AuthRequestPayload;
+  }
+
+  private async parseTokenBody(req: Request): Promise<URLSearchParams | null> {
+    const ct = (req.headers.get("content-type") ?? "").toLowerCase();
+    const raw = await req.text();
+    if (ct.includes("application/json")) {
+      try {
+        const obj = JSON.parse(raw) as Record<string, string>;
+        return new URLSearchParams(obj);
+      } catch {
+        return null;
+      }
+    }
+    return new URLSearchParams(raw);
+  }
+}

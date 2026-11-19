@@ -1,6 +1,6 @@
 // Hybrid search (ADR 012, spec v2 §5.5): keyword (D1 FTS5) and semantic (Vectorize) results
 // fused by rank. Pure functions here; the tool wires the two queries.
-import { norm } from "../lib/notes";
+import { norm } from "../lib/notes.js";
 
 export type Hit = { path: string; seq: number; text: string };
 export type Fused = { path: string; text: string; matched: "keyword" | "semantic" | "both"; score: number };

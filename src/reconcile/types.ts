@@ -1,6 +1,6 @@
 // Reconciliation (ADR 009, spec v2 §5.3): a Workflow compares the notes with the index manifest
 // and enqueues fixes. It never writes the index itself: the Queue consumer stays the only writer.
-import type { DropMessage, IndexMessage } from "../indexer/types";
+import type { DropMessage, IndexMessage } from "../indexer/types.js";
 export type { DropMessage };
 
 export type Mode = "daily" | "rebuild";
