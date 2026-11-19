@@ -1,6 +1,6 @@
-// The write path (ADR 008): operations go to one writer per repository, which applies them
-// to a working copy under a mutex and pushes. The working copy is a port: Artifacts over Git
-// in production, an in-memory fake in tests.
+// The write path: operations go to one writer per repository, which applies them to a working
+// copy under a mutex, commits and (with a backup remote) pushes. The working copy is a port: the
+// local Git CLI in production, an in-memory fake in tests.
 
 export type Operation =
   | { kind: "write"; path: string; content: string; expectedVersion?: string } // overwriting needs the version read_note returned

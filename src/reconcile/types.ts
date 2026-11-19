@@ -1,12 +1,12 @@
-// Reconciliation (ADR 009, spec v2 §5.3): a Workflow compares the notes with the index manifest
-// and enqueues fixes. It never writes the index itself: the Queue consumer stays the only writer.
+// Reconciliation: compares the notes in Git with the index manifest and enqueues fixes.
+// It never writes the index itself: the IndexQueue consumer stays the only writer.
 import type { DropMessage, IndexMessage } from "../indexer/types.js";
 export type { DropMessage };
 
 export type Mode = "daily" | "rebuild";
 export type NoteSha = { path: string; sha: string; chunks?: number };
 
-/** The few Workflow features we use, so the orchestration can be tested without the runtime. */
+/** A named step runner, so the orchestration can be tested and each phase logged on its own. */
 export interface Step {
   do<T>(name: string, fn: () => Promise<T>): Promise<T>;
 }

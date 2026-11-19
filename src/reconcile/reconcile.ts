@@ -3,8 +3,8 @@ import type { DropMessage, Mode, NoteSha, ReconcileDeps, Report, Step } from "./
 import { ALERT_ABOVE, BATCH } from "./types.js";
 
 /**
- * Compares the notes with the index and enqueues what needs fixing. Each phase is a Workflow step,
- * so a failure resumes from the step that failed, not from the start (ADR 009).
+ * Compares the notes with the index and enqueues what needs fixing, one named step per phase.
+ * It only enqueues, so a failed run is safe to repeat.
  */
 export async function runReconcile(mode: Mode, step: Step, deps: ReconcileDeps): Promise<Report> {
   const reason = mode === "rebuild" ? "rebuild" : "reconcile";

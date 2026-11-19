@@ -1,4 +1,4 @@
-// Hybrid search (ADR 012, spec v2 §5.5): keyword (D1 FTS5) and semantic (Vectorize) results
+// Hybrid search: keyword (SQLite FTS5) and semantic (embedding cosine similarity) results
 // fused by rank. Pure functions here; the tool wires the two queries.
 import { norm } from "../lib/notes.js";
 
@@ -25,7 +25,7 @@ export function buildFtsQuery(query: string): string | null {
   return unique.length ? unique.map((t) => `"${t}"*`).join(" OR ") : null;
 }
 
-/** Vectorize matches above the similarity floor, as hits; vectors without a path are dropped. */
+/** Vector matches above the similarity floor, as hits; vectors without a path are dropped. */
 export function semanticHits(matches: { score: number; metadata?: Record<string, unknown> }[], floor: number): Hit[] {
   return matches
     .filter((m) => m.score >= floor && typeof m.metadata?.path === "string")

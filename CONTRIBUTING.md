@@ -2,22 +2,27 @@
 
 ## Development
 
-Node 24 or later.
+Node 24 or later (`.nvmrc`), and `git` on the `PATH`.
 
 ```sh
 npm ci
+cp .env.example .env    # DATA_DIR defaults to ./data for local runs
+npm run dev             # tsx watch on src/index.ts
+```
+
+Checks (the same ones CI runs on every push and PR):
+
+```sh
+npm run lint            # no em-dashes anywhere in the repo
 npm run typecheck
-npm test              # Vitest inside workerd, with local D1, KV, Queues and Workflows
-npm run test:ui       # the same tests in the Vitest UI
+npm run build
+npm test                # Vitest, in-process with node:sqlite and fake git/indexer ports
 ```
 
 To deploy your own: [docs/setup.md](docs/setup.md).
 
 ## How changes are made
 
-1. **Failing tests first.** Each PR starts with a red commit that describes the behavior; the next commit makes it green. A known bug can be pinned with `it.fails`, which turns red once the bug is fixed.
-2. **CI on every PR:** typecheck, the Vitest suite inside workerd, and the script tests (`bash test/scripts/run.sh`). CI comments a report with a link to the Vitest UI for each commit.
-3. **Review** by a separate reviewer with a clean context (only the diff and the docs).
-4. **Merge to `main` deploys** (D1 migrations, then `wrangler deploy`).
-
-Decisions that change the design get an ADR in [`docs/adr/`](docs/adr/).
+1. **Tests first.** Describe the behavior in a failing test, then make it pass. A known bug can be pinned with `it.fails`, which turns red once the bug is fixed.
+2. **Conventional Commits** (`feat:`, `fix:`, `docs:`, `chore:`...).
+3. **CI must be green**: lint, typecheck, build and tests.

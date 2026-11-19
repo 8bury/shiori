@@ -22,14 +22,14 @@ const pushed = (before: string, after: string, ref = "refs/heads/main", repoName
   payload: { ref, before, after },
 });
 
-describe("index(path) (spec v2 §5.2)", () => {
+describe("index(path)", () => {
   it("indexes a note and records exactly that version in the manifest", async () => {
     expect(await handle({ type: "index", path: "a.md", reason: "write" }, deps)).toEqual({ kind: "indexed", path: "a.md", chunks: 1 });
     expect(index.pathsIndexed()).toEqual(["a.md"]);
     expect(await manifest.get("a.md")).toEqual({ path: "a.md", sha: "sha(alpha)", chunks: 1 });
   });
 
-  it("writes the same chunks to the keyword index (ADR 012)", async () => {
+  it("writes the same chunks to the keyword index", async () => {
     await handle({ type: "index", path: "a.md", reason: "write" }, deps);
     expect(keywords.rows.get("a.md")).toEqual(["alpha"]);
   });
@@ -97,7 +97,7 @@ describe("index(path) (spec v2 §5.2)", () => {
 
   it("throws when embedding fails, so the queue retries, and records nothing", async () => {
     embedder.fail = true;
-    await expect(handle({ type: "index", path: "a.md", reason: "write" }, deps)).rejects.toThrow(/Workers AI/);
+    await expect(handle({ type: "index", path: "a.md", reason: "write" }, deps)).rejects.toThrow(/embedding provider/);
     expect(await manifest.get("a.md")).toBeNull();
   });
 });

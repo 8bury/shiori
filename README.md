@@ -41,6 +41,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the OAuth 2.1 and hybrid search flow 
    - `EMBEDDING_PROVIDER` (`openai`, `gemini`, or `none`) and `EMBEDDING_API_KEY`
    - `ALLOWED_REDIRECT_PREFIXES` (comma-separated callback prefixes for extra clients like Muse or Grok; Claude, ChatGPT, and localhost are allowed by default)
 
+Full setup, importing existing notes, and operations: [docs/setup.md](docs/setup.md).
+
 ## Local development
 
 ```sh

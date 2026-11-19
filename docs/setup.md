@@ -1,30 +1,51 @@
 # Setup
 
-`npm run deploy-your-own` runs every step below, in order.
+Shiori is one Docker container. It keeps all its state in a single volume mounted at `/data`:
 
-Everything that changes per deployment is in `wrangler.jsonc`: `name`, `account_id`, `vars` (`PUBLIC_URL`, `CF_ACCOUNT_ID`, `OWNER_GITHUB_ID`, `GITHUB_CLIENT_ID`), and the D1 and KV ids, which `scripts/setup.sh` writes itself. The scripts read it through `scripts/config.mjs`; `node scripts/config.mjs check` validates it.
+| Path | What |
+|---|---|
+| `/data/notes` | Git repository of Markdown notes (every edit is a commit) |
+| `/data/shiori.db` | SQLite: OAuth clients and grants, episodic memory, search index (FTS5 + vectors) |
+| `/data/memory.log` | Plain-text append-only copy of every memory, for disaster recovery |
+
+Back up the volume and you have backed up everything. The search index can always be rebuilt from the notes.
 
 ## Requirements
-- Node 24 or later (`.nvmrc`), then `npm ci`.
-- `npx wrangler login` with access to the Cloudflare account in `wrangler.jsonc`.
+
+- A Docker host with HTTPS in front of it (Coolify, Traefik, Caddy, nginx...). OAuth clients like Claude and ChatGPT require a public `https://` URL.
+- A GitHub account (sign-in only proves identity; no scopes are requested).
+- Optional: an OpenAI or Gemini API key for semantic search. Without one, search is keyword-only (FTS5).
 
 ## Steps
-Order matters: the notes must be in Artifacts before any deploy that reads from it, or the server lists no notes and the first MCP write starts a separate history.
 
-1. **Resources:** `scripts/setup.sh`. Creates what is missing (Vectorize index, Artifacts repo `notes`, D1 database and its migrations, the `index-jobs` queues and the Artifacts push subscription) and is safe to run again. It writes the D1 and KV ids into `wrangler.jsonc` itself. Changing an existing Workers subdomain is a dashboard step; the script stops and says so.
-2. **Notes:** push the full history into the Artifacts repo once, from a clone: `git push <remote> main`, with a token from `npx wrangler artifacts repos issue-token "$(node scripts/config.mjs NOTES_REPO)" --namespace "$(node scripts/config.mjs namespace)" --scope write`. After that, write only through MCP ([ADR 014](adr/014-mcp-only-clients.md)): stop pushing from the old clone.
-3. **Deploy:** `npx wrangler deploy` the first time (the Worker must exist before it has secrets). After that, merges to `main` deploy through CI.
-4. **Secrets:**
-   - `scripts/secrets.sh github-oauth` (same as `npx wrangler secret put GITHUB_CLIENT_SECRET`): paste the GitHub OAuth app's client secret into Wrangler's hidden prompt. The app's client id is public and lives in `wrangler.jsonc` (`GITHUB_CLIENT_ID`), with `OWNER_GITHUB_ID`; its callback URL is `<PUBLIC_URL>/callback`.
-   - `scripts/secrets.sh admin`: new `ADMIN_SECRET` for the admin routes, saved to the Worker and `.dev.vars`.
-   - `scripts/secrets.sh hook`: new `HOOK_SECRET`, which can only issue Artifacts tokens, saved to the Worker, `.dev.vars` and the macOS Keychain (the read-only mirror, `npm run mirror`, reads it there).
-5. **Index:** start a rebuild once: `POST /admin/reconcile?mode=rebuild` with `Authorization: Bearer <ADMIN_SECRET>`. It enqueues every note. After that, the daily reconciliation keeps the index in line.
-6. **Clients:** add `<PUBLIC_URL>/mcp` as a remote MCP server in each client; it starts the OAuth sign-in (consent page, then GitHub). Every client, Claude Code included, reads and writes only through MCP.
-7. **Mirror (optional):** `npm run mirror -- <folder>` keeps a read-only copy for viewing, such as Obsidian's graph view. Run it on a schedule; it resets the folder each time, so never edit there.
+1. **GitHub OAuth App.** In *Settings → Developer settings → OAuth Apps*, create an app with:
+   - Homepage URL: `https://shiori.yourdomain.com`
+   - Authorization callback URL: `https://shiori.yourdomain.com/callback`
 
-## CI deploy
-The `deploy` job in `.github/workflows/ci.yml` runs on pushes to `main` after the tests. It applies D1 migrations, then deploys. It needs a repository secret `CLOUDFLARE_API_TOKEN`: a Cloudflare API token with the **Edit Cloudflare Workers** template plus **D1: Edit** and **Queues: Edit**, limited to this account. Set it with `gh secret set CLOUDFLARE_API_TOKEN`.
+   Note the client id, generate a client secret, and look up your numeric user id at `https://api.github.com/users/<username>`.
+2. **Environment.** Copy [`.env.example`](../.env.example) and fill in at least `PUBLIC_URL`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `OWNER_GITHUB_ID` and `ADMIN_SECRET` (`openssl rand -hex 32`). Set `EMBEDDING_PROVIDER` and `EMBEDDING_API_KEY` for semantic search.
+3. **Run the container.** With Coolify, point a resource at the repository's `Dockerfile`, mount a persistent volume at `/data`, and set the domain. With plain Docker:
 
-## Related
-- [ADR 006](adr/006-wrangler-and-a-setup-script-instead-of-terraform.md)
-- [Spec v2](spec/v2.md), §8
+   ```sh
+   docker build -t shiori .
+   docker run -d --name shiori --env-file .env -p 3000:3000 -v shiori-data:/data shiori
+   ```
+
+   The container has a `HEALTHCHECK` on `GET /health`.
+4. **Import existing notes (optional).** Put Markdown files in `/data/notes` and commit them, or clone an existing notes repository there before the first start. Then build the index once:
+
+   ```sh
+   curl -X POST -H "Authorization: Bearer $ADMIN_SECRET" "https://shiori.yourdomain.com/admin/reconcile?mode=rebuild"
+   ```
+
+   After that, a daily reconciliation keeps the index in line with Git.
+5. **Backup remote (optional).** Set `GIT_REMOTE_URL` to a private repository. Shiori syncs with it and pushes every commit. Prefer an SSH deploy key or a fine-grained token scoped to that one repository.
+6. **Connect clients.** Add `https://shiori.yourdomain.com/mcp` as a remote MCP server in each client (see the [README](../README.md#connecting-your-agents)). The first connection opens the consent page and then GitHub sign-in.
+
+## Operations
+
+- **Grants:** `GET /admin/grants` lists connected clients; `DELETE /admin/grants/<id>` revokes one. Both need `Authorization: Bearer <ADMIN_SECRET>`; without it they answer `404`.
+- **Index repair:** `POST /admin/reconcile` repairs drift between Git and the index; `?mode=rebuild` re-indexes every note.
+- **New client refused:** if a client gets `403` during sign-in, the logs show `{"auth":"redirect refused","redirectUri":"..."}`. Add that callback prefix to `ALLOWED_REDIRECT_PREFIXES` and restart.
+- **Daily maintenance** runs in-process: reconciliation plus purging expired OAuth sessions, codes and tokens.
+- **Shutdown:** on `SIGTERM` the server stops accepting requests, drains the indexing queue and closes the database.

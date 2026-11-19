@@ -76,7 +76,7 @@ export class FakeEmbedder implements Embedder {
   fail = false;
   async embed(texts: string[]) {
     this.calls++;
-    if (this.fail) throw new Error("Workers AI unavailable");
+    if (this.fail) throw new Error("embedding provider unavailable");
     return texts.map((t) => [t.length, 1, 0]);
   }
 }

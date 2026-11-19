@@ -1,7 +1,7 @@
-// The indexer (ADR 009, ADR 010, spec v2 §5.2): the Queue consumer is the only writer of the
-// semantic index (Vectorize) and of the manifest (D1). Ports keep the logic testable.
+// The indexer: the IndexQueue consumer is the only writer of the keyword index, the vectors and
+// the manifest (all in SQLite). Ports keep the logic testable.
 
-/** Messages on the index-jobs queue (spec v2 §4.5). */
+/** Messages on the in-process IndexQueue. */
 export type PushedEvent = {
   type: "cf.artifacts.repo.pushed";
   source: { type: "artifacts.repo"; namespace: string; repoName: string };
@@ -52,7 +52,7 @@ export interface Manifest {
   remove(path: string): Promise<void>;
 }
 
-/** The keyword index (D1 FTS5, ADR 012): the same chunks as the vectors. */
+/** The keyword index (SQLite FTS5): the same chunks as the vectors. */
 export interface KeywordIndex {
   replace(path: string, chunks: string[]): Promise<void>;
   remove(path: string): Promise<void>;

@@ -13,7 +13,7 @@ beforeEach(() => {
   writer = new Writer(copy);
 });
 
-describe("Writer: concurrency (#5, ADR 008)", () => {
+describe("Writer: concurrency (#5)", () => {
   it("keeps both of two concurrent edits to the same note", async () => {
     const [r1, r2] = await Promise.all([
       writer.run({ kind: "edit", path: "a.md", oldText: "alpha", newText: "ALPHA" }),

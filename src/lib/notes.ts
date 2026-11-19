@@ -6,7 +6,7 @@ export const MAX_CHUNKS = 50; // max chunks per note, also used to delete leftov
 // strips accents and case, so "decisão" matches "decisao"
 export const norm = (s: string) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 
-// Path rules for every read and write (spec v2 §3): relative to the repo root, Markdown only,
+// Path rules for every read and write: relative to the repo root, Markdown only,
 // at most 512 bytes, never outside the repo.
 export function checkPath(path: string) {
   const p = path.trim();
@@ -35,7 +35,7 @@ export function chunk(body: string): string[] {
   return out.slice(0, MAX_CHUNKS);
 }
 
-// short, stable id (Vectorize accepts up to 64 bytes): path hash + chunk number
+// short, stable id (at most 64 bytes): path hash + chunk number
 export async function pathHash(path: string) {
   const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(path));
   return [...new Uint8Array(h)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");

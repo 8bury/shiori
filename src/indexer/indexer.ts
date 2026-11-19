@@ -55,7 +55,7 @@ async function fanOut(ev: PushedEvent, deps: Deps): Promise<Outcome> {
 /**
  * Brings one note's index entries in line with the head of main. Always reads at the head (never
  * at the commit an event named), and records in the manifest only what it actually wrote: if the
- * note changed while indexing, it records nothing and re-enqueues (ADR 010).
+ * note changed while indexing, it records nothing and re-enqueues.
  */
 async function indexPath(msg: IndexMessage, deps: Deps): Promise<Outcome> {
   const { path } = msg;

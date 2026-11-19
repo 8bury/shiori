@@ -1,7 +1,7 @@
 import type { Change, Operation, WorkingCopy, WriteResult } from "./types.js";
 import { noteVersion } from "./version.js";
 
-const MAX_ATTEMPTS = 3; // pushes before giving up as busy (spec v2 §5.1)
+const MAX_ATTEMPTS = 3; // pushes before giving up as busy
 
 class OperationError extends Error {
   constructor(message: string, readonly code?: "exists" | "conflict") {
@@ -60,7 +60,7 @@ function message(op: Operation) {
 }
 
 /**
- * The only Git writer for one repository (ADR 008). Writes run one at a time (an in-memory mutex:
+ * The only Git writer for one repository. Writes run one at a time (an in-memory mutex:
  * a promise chain), each applied to the working copy inside the lock, committed and pushed.
  */
 export class Writer {

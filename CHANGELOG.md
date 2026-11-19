@@ -2,51 +2,24 @@
 
 ## Unreleased
 
-### Changed
-- **`write_note` checks the version before overwriting**: `read_note` returns a version, `write_note` needs it as `expected_version` to overwrite an existing note, and a stale or missing version is a `conflict` with nothing written. Closes a silent lost update when two agents overwrite the same note ([ADR 013](docs/adr/013-version-check-on-overwrite.md)).
-- **Every client reads and writes only through MCP**, Claude Code on the Mac included. Every write now goes through the Durable Object and its version check ([ADR 014](docs/adr/014-mcp-only-clients.md)).
+Shiori is a re-architecture of [second-brain-mcp](https://github.com/YudiG12/second-brain-mcp) as a self-hosted Node 24 + SQLite + Git server.
 
 ### Added
-- `npm run mirror`: an optional read-only copy of the notes in a folder, for viewing (Obsidian's graph view). It fetches and resets; it never edits or pushes.
+- **Episodic memory tree**: `memory_wake`, `memory_note`, `memory_nap`, `memory_recall`, `memory_zoom` and `memory_forget`. One-line memories in an append-only log, summarized into a power-of-2 binary tree; `memory_wake` returns recent memories verbatim and older ones compressed within `MEMORY_WAKE_LINES`. Every memory is also appended to `/data/memory.log`.
+- MCP server `instructions` that tell agents how to use the memory, plus [MEMORY_PROMPT.md](MEMORY_PROMPT.md) for custom instructions.
+- `ALLOWED_REDIRECT_PREFIXES` and `ALLOW_ALL_HTTPS_REDIRECTS` for clients beyond Claude and ChatGPT (Muse, Grok...).
+- Embeddings from OpenAI or Gemini (`EMBEDDING_PROVIDER`), or keyword-only search with `none`.
+- Optional backup push of the notes repository to `GIT_REMOTE_URL`.
+
+### Changed
+- **Runs as one Node 24 container** with SQLite (`node:sqlite`) and a local Git repository, in place of Cloudflare Workers, Artifacts, Durable Objects, Queues, D1, Vectorize and Workflows.
+- **OAuth 2.1** is a built-in server stored in SQLite (PKCE S256, CIMD with SSRF checks, dynamic registration, consent page, GitHub owner check, refresh token rotation).
+- Tests run in plain Node with Vitest instead of inside workerd.
+
+### Kept from second-brain-mcp
+- Notes tools: `list_notes`, `read_note`, `search_notes` (hybrid FTS5 + semantic, fused by reciprocal rank), `write_note` (with `expected_version`), `edit_note`, `delete_note`, `move_note`. Every edit is one Git commit.
+- Daily reconciliation and on-demand rebuild of the search index; admin routes to list and revoke grants.
 
 ### Removed
-- **`semantic_search`**: `search_notes` already runs the same semantic search, with a similarity floor, and fuses it with keywords. One search tool, so an agent never has to pick ([ADR 015](docs/adr/015-one-search-tool.md)).
-- The Claude Code sync hook (`clients/claude-code/`, `npm run mac-hook`, `scripts/merge-hooks.mjs`) and its shell tests. The `/hook/artifacts-token` route and `HOOK_SECRET` stay, for the mirror.
-
-## v2 (2026-11-06)
-
-Built in one day as a series of PRs, each one red tests first, then green, then a review by a separate agent with a clean context before merge. Decisions in [ADR 006](docs/adr/006-wrangler-and-a-setup-script-instead-of-terraform.md) to [ADR 012](docs/adr/012-hybrid-search-with-d1-fts5.md); design in [spec v2](docs/spec/v2.md).
-
-### Changed
-- **Notes live in Cloudflare Artifacts**, not GitHub: Git storage inside Cloudflare, read through a binding, no external token or rate limit ([ADR 007](docs/adr/007-cloudflare-artifacts-for-the-notes.md), #44).
-- **Writes go through one Durable Object per repository** (`RepoWriter`): an in-memory mutex serializes them, the operation is applied inside the lock, a push rejected because the Mac pushed first is re-run on the new tip, and a lost push response is confirmed against the remote before reporting ([ADR 008](docs/adr/008-one-durable-object-per-repository.md), #44).
-- **Indexing runs on a Queue** with retries and a dead-letter queue; the consumer is the only writer of the index, records what it indexed in a D1 manifest, and skips work already done ([ADR 009](docs/adr/009-queue-for-indexing-workflow-for-reconciliation.md), [ADR 010](docs/adr/010-index-manifest-in-d1.md), #46).
-- **`search_notes` is hybrid**: a D1 FTS5 keyword index and Vectorize, fused by reciprocal rank; it no longer reads every note ([ADR 012](docs/adr/012-hybrid-search-with-d1-fts5.md), #53).
-- **OAuth 2.1 with GitHub sign-in** replaces the token in the URL: consent page, a redirect allowlist (the Claude and ChatGPT connector callbacks, plus loopback for local apps), owner-only, per-client grants that can be revoked ([ADR 011](docs/adr/011-oauth-with-github-login.md), #51, #55).
-- **The Mac sync hook** merges instead of rebasing, so local commits are never rewritten; conflicts keep the remote version and save the local one as a `.conflict` copy; one sync at a time per clone; its own scoped secret (#50).
-- **Infrastructure from the repo**: `wrangler.jsonc` + idempotent `scripts/setup.sh`, English names everywhere, deploy on merge ([ADR 006](docs/adr/006-wrangler-and-a-setup-script-instead-of-terraform.md), #43).
-
-### Added
-- Daily **reconciliation** and an on-demand **rebuild** as a Cloudflare Workflow (#48).
-- **Tests and CI**: 147 Vitest tests running inside workerd (local D1, KV, Queues, Workflows), 48 shell scenarios for the hook, a per-commit test report with the Vitest UI on every PR (#41 and later).
-- **Measurements** of v1 and v2 in production ([spec v2 §10](docs/spec/v2.md), #45, #54).
-- Admin routes to list and revoke OAuth grants, and to start a reconciliation or rebuild.
-
-### Fixed
-- Concurrent edits to the same note could silently lose one (#5).
-- `move_note` was two commits, not atomic (#10).
-- Failed indexing was never retried (#6); deleted notes stayed in the index (#7); `/reindex` was not a real rebuild (#8).
-- `read_note` didn't validate paths (#30); `save_idea` overwrote same-day ideas (#31).
-- The sync hook stopped silently on a rebase conflict (#15) and collided across sessions (#16).
-
-### Measured (p50 of 10 runs, production; indicative)
-| | v1 | v2 |
-|---|---|---|
-| Write | 4.1 s | 2.1 s |
-| New note findable by keyword | immediate (reads every note) | ~12 s |
-| New note findable by meaning | 122 s | 53 s |
-| `search_notes` | 2.8 s (reads all notes) | 1.5 s (reads none) |
-
-## v1 (2026-11-05)
-
-A remote MCP server on Cloudflare Workers over a GitHub repo of Markdown notes: nine tools, semantic search with Workers AI (bge-m3) and Vectorize, a push webhook to re-index, Claude Code hooks to keep the Mac's clone in sync, and a secret token in the URL. Documented after the fact in [PRD v1](docs/prd/v1.md), [spec v1](docs/spec/v1.md) and [ADR 001 to 005](docs/adr/).
+- Cloudflare deployment (`wrangler`, setup scripts, D1 migrations, CI deploy), the Artifacts token hook and `HOOK_SECRET`, and the production measurement scripts.
+- The v1/v2 PRDs, specs, ADRs and measurements of the Cloudflare version. They remain in Git history and in the upstream repository.
