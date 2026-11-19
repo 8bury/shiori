@@ -1,7 +1,5 @@
 # Architecture (v2)
 
-![Architecture of v2](docs/architecture/v2.png)
-
 | Concern | How | Decision |
 |---|---|---|
 | Where notes live | Cloudflare **Artifacts** (Git), read through a binding | [ADR 007](docs/adr/007-cloudflare-artifacts-for-the-notes.md) |
@@ -14,36 +12,6 @@
 | Infrastructure | `wrangler.jsonc` + an idempotent setup script; deploy on merge | [ADR 006](docs/adr/006-wrangler-and-a-setup-script-instead-of-terraform.md) |
 
 **Limits of this design.** All writes to one repository go through one Durable Object, about two writes per second from the spike's measurements; a team would shard by repository ([at scale](docs/design/at-scale.md)). A missed push event waits for the daily reconciliation, so the index can lag by up to a day, never stay wrong.
-
-## Flows
-
-### 1. Sign-in
-
-<p align="center"><img src="docs/architecture/flows/1-sign-in.png" alt="Flow 1: Sign-in" width="622"></p>
-
-### 2. Write a note
-
-<p align="center"><img src="docs/architecture/flows/2-write.png" alt="Flow 2: Write a note" width="836"></p>
-
-### 3. Index in the background
-
-<p align="center"><img src="docs/architecture/flows/3-index.png" alt="Flow 3: Index in the background" width="879"></p>
-
-### 4. Read a note
-
-<p align="center"><img src="docs/architecture/flows/4-read.png" alt="Flow 4: Read a note" width="611"></p>
-
-### 5. Search
-
-<p align="center"><img src="docs/architecture/flows/5-search.png" alt="Flow 5: Search" width="836"></p>
-
-### 6. Reconciliation
-
-<p align="center"><img src="docs/architecture/flows/6-reconcile.png" alt="Flow 6: Reconciliation" width="622"></p>
-
-### 7. A job that keeps failing
-
-<p align="center"><img src="docs/architecture/flows/7-failure.png" alt="Flow 7: A job that keeps failing" width="836"></p>
 
 ## Repository
 
