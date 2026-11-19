@@ -202,7 +202,7 @@ export class MemoryStore {
     const pending = this.nextPendingMerge();
     const out = [`Memory (${total} total entries, showing ${lines.length} lines):`];
     if (omitted > 0) {
-      out.push(`(${omitted} older unsummarized entries omitted — run memory_nap to compress)`);
+      out.push(`(${omitted} older unsummarized entries omitted; run memory_nap to compress)`);
     }
     out.push(...lines);
     if (pending) {
@@ -296,8 +296,8 @@ export class MemoryStore {
     if (range.hi >= total) return `Range #${range.lo}-${range.hi} is out of bounds (total memories: ${total}).`;
 
     const mid = Math.floor((range.lo + range.hi) / 2);
-    const left = this.nodeText(range.lo, mid) ?? `#${range.lo}-${mid} (unsummarized — zoom further)`;
-    const right = this.nodeText(mid + 1, range.hi) ?? `#${mid + 1}-${range.hi} (unsummarized — zoom further)`;
+    const left = this.nodeText(range.lo, mid) ?? `#${range.lo}-${mid} (unsummarized; zoom further)`;
+    const right = this.nodeText(mid + 1, range.hi) ?? `#${mid + 1}-${range.hi} (unsummarized; zoom further)`;
     return [`Zoom #${range.lo}-${range.hi}:`, `  ${left}`, `  ${right}`].join("\n");
   }
 

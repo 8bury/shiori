@@ -45,7 +45,7 @@ out.push("\n</details>");
 const previous = process.env.PREVIOUS && existsSync(process.env.PREVIOUS) ? readFileSync(process.env.PREVIOUS, "utf8") : "";
 const oldRows = (previous.split("<!-- history -->")[1] ?? "").split("<!-- /history -->")[0].split("\n").filter((l) => /^\| (\[`|`)/.test(l));
 const commitCell = sha ? (repo ? `[\`${sha.slice(0, 7)}\`](https://github.com/${repo}/commit/${sha})` : `\`${sha.slice(0, 7)}\``) : "`local`";
-const reportLink = process.env.UI_VERSION_URL ? `[report](${process.env.UI_VERSION_URL})` : "—";
+const reportLink = process.env.UI_VERSION_URL ? `[report](${process.env.UI_VERSION_URL})` : "-";
 const row = `| ${commitCell} | ${ok ? "✅" : "❌"} ${count("passed")} passed${failed.length ? `, ${failed.length} failed` : ""} | ${reportLink} |`;
 const rows = [row, ...oldRows.filter((r) => !sha || !r.includes(sha.slice(0, 7)))].slice(0, 30);
 out.push("\n**History** (newest first; each link is that commit's Vitest UI report)\n");

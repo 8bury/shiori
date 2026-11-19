@@ -1,11 +1,13 @@
 {
   "name": "shiori",
+  "description": "Shared memory and Markdown notes for all your AI agents. Self-hosted MCP server with binary-tree episodic memory, hybrid search, Git history, and OAuth 2.1.",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
+    "lint": "node scripts/lint-no-emdash.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
