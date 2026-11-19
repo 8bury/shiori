@@ -14,7 +14,7 @@ import type { Mode, Report } from "./reconcile/types.js";
 import { buildFtsQuery, fuse, semanticHits, type Hit } from "./search/hybrid.js";
 import { openDatabase } from "./storage/db.js";
 import { createEmbedder } from "./storage/embedder.js";
-import { createReconcileSource, ensureGitRepo, LocalGitNotesSource, LocalGitWorkingCopy } from "./storage/git.js";
+import { createReconcileSource, ensureGitRepo, LocalGitNotesSource, LocalGitWorkingCopy, redactCredentials } from "./storage/git.js";
 import { SqliteAlerts, SqliteKeywords, SqliteManifest, SqliteReconcileIndex, SqliteVectorIndex } from "./storage/sqlite-adapters.js";
 import type { Operation, WriteResult } from "./writer/types.js";
 import { noteVersion } from "./writer/version.js";
@@ -49,7 +49,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
   const keywords = new SqliteKeywords(db);
   const vectors = new SqliteVectorIndex(db);
   const alerts = new SqliteAlerts(db);
-  const memory = new MemoryStore(db, config.memoryWakeLines, path.join(config.notesDir, "_memory", "LOG.txt"));
+  const memory = new MemoryStore(db, config.memoryWakeLines, path.join(config.dataDir, "memory.log"));
   const embedder = options.embedder ?? createEmbedder(config);
 
   const queue: IndexQueue = new IndexQueue(
@@ -72,19 +72,19 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     try {
       return await writer.run(op);
     } catch (e) {
-      return { status: "unknown", reason: String(e) };
+      return { status: "unknown", reason: redactCredentials(String(e)) };
     }
   }
 
   async function describe(r: WriteResult, op: Operation, done: string): Promise<string> {
     switch (r.status) {
       case "failed":
-        return r.reason;
+        return redactCredentials(r.reason);
       case "busy":
         return "The notes are changing too fast right now; nothing was saved. Try again.";
       case "unknown":
         await queue.enqueue(opPaths(op).map((p) => ({ type: "index", path: p, reason: "write" }))).catch(() => {});
-        return `Not sure the change to ${opPaths(op).join(" and ")} was saved (${r.reason}). Check it with read_note before retrying.`;
+        return `Not sure the change to ${opPaths(op).join(" and ")} was saved (${redactCredentials(r.reason)}). Check it with read_note before retrying.`;
     }
     const saved = `${done} (${r.commit.slice(0, 7)}). Search reflects it shortly.`;
     try {
@@ -140,10 +140,10 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     server.registerTool(
       "memory_recall",
       {
-        description: "Searches every raw episodic memory ever recorded, word for word (case-insensitive regex or substring).",
-        inputSchema: { pattern: z.string(), limit: z.number().int().min(1).max(200).optional() },
+        description: "Searches every raw episodic memory ever recorded, word for word (case-insensitive substring by default; set regex=true for safe regex).",
+        inputSchema: { pattern: z.string(), limit: z.number().int().min(1).max(200).optional(), regex: z.boolean().optional() },
       },
-      async ({ pattern, limit }) => text(memory.recall(pattern, limit ?? 50)),
+      async ({ pattern, limit, regex }) => text(memory.recall(pattern, limit ?? 50, regex ?? false)),
     );
 
     server.registerTool(
@@ -351,7 +351,8 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
         return Response.json(oauth.listGrants(config.ownerGithubId), { headers: { "Cache-Control": "no-store" } });
       }
       if (request.method === "DELETE" && id) {
-        oauth.revokeGrant(id, config.ownerGithubId);
+        const revoked = oauth.revokeGrant(id, config.ownerGithubId);
+        if (!revoked) return new Response("Grant not found", { status: 404 });
         return Response.json({ revoked: id });
       }
       return new Response("Method not allowed", { status: 405 });

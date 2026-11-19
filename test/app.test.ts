@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
+import { isPrivateIp, redirectAllowed } from "../src/auth/oauth";
 import { loadConfig } from "../src/config";
 import type { Embedder } from "../src/indexer/types";
 
@@ -326,6 +327,15 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     );
     expect(revRes.status).toBe(200);
 
+    // Revoking an already-deleted/missing grant returns 404 (L5)
+    const revMissing = await app.fetch(
+      new Request(`https://brain.example.com/admin/grants/${grants[0].id}`, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer super-secret-admin" },
+      }),
+    );
+    expect(revMissing.status).toBe(404);
+
     // Revoked token is immediately rejected
     const afterRevoke = await app.fetch(
       new Request("https://brain.example.com/mcp", {
@@ -335,5 +345,16 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
       }),
     );
     expect(afterRevoke.status).toBe(401);
+  });
+
+  it("hardens redirect prefix matching (L1) and CIMD private IP blocking (M1)", () => {
+    expect(redirectAllowed("https://muse.app/cb", ["https://muse.app"])).toBe(true);
+    expect(redirectAllowed("https://muse.app.evil.com/cb", ["https://muse.app"])).toBe(false);
+    expect(isPrivateIp("127.0.0.1")).toBe(true);
+    expect(isPrivateIp("169.254.169.254")).toBe(true);
+    expect(isPrivateIp("10.0.0.5")).toBe(true);
+    expect(isPrivateIp("192.168.1.1")).toBe(true);
+    expect(isPrivateIp("::1")).toBe(true);
+    expect(isPrivateIp("1.1.1.1")).toBe(false);
   });
 });

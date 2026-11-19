@@ -14,7 +14,7 @@ describe("checkPath", () => {
 
   // spec v2 §3: relative, .md, at most 512 bytes, no "..", no empty or "." segments, no leading "/",
   // no backslash or control characters
-  it.each(["../x.md", "a/../b.md", "a//b.md", "notes.txt", "a/", "", "/projetos/x.md", "./a.md", "a/./b.md", "a\\b.md", "a\u0000.md", "x".repeat(510) + ".md"])("rejects %j", (input) => {
+  it.each(["../x.md", "a/../b.md", "a//b.md", "notes.txt", "a/", "", "/projetos/x.md", "./a.md", "a/./b.md", ".git/x.md", "a/.git/x.md", "a\\b.md", "a\u0000.md", "x".repeat(510) + ".md"])("rejects %j", (input) => {
     expect(() => checkPath(input)).toThrow(/Invalid path/);
   });
 });

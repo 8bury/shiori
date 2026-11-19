@@ -146,14 +146,28 @@ describe("MemoryStore", () => {
     expect(zoomed).toContain("#0-1");
     expect(zoomed).toContain("#2-3");
 
-    // Recall searches raw log word-for-word
-    const recalled = store.recall("grok.*oauth");
+    // Recall searches raw log (substring by default, safe regex opt-in)
+    expect(store.recall("Grok Bot")).toContain("#2 [");
+    const recalled = store.recall("grok.*oauth", 50, true);
     expect(recalled).toContain("#2 [");
     expect(recalled).toContain("Connected Grok Bot");
+    expect(store.recall("(a+)+", 50, true)).toContain("Unsafe");
 
     // Forget #0-1 drops #0-1 AND its ancestor #0-3, and prompts rebuild
     const forgot = store.forget("0-1");
     expect(forgot).toContain("Dropped 2 summary node(s)");
     expect(forgot).toContain("COMPRESSION DUE for #0-1");
+
+    // M3: nap refuses parent when child #0-1 is missing
+    expect(store.nap("0-3", "Premature summary")).toContain("child #0-1 must be summarized first");
+  });
+
+  it("caps wake output even when many entries are unsummarized (M4)", () => {
+    for (let i = 0; i < 10; i++) store.note(`Unsummarized entry ${i}`, "test");
+    const woke = store.wake(4);
+    const body = woke.split("\n\n")[0];
+    expect(body).toContain("6 older unsummarized entries omitted");
+    expect(body).toContain("#9 [");
+    expect(body).not.toContain("#0 [");
   });
 });

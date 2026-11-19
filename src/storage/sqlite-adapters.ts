@@ -124,8 +124,16 @@ export class SqliteVectorIndex implements VectorIndex {
       embedding: Uint8Array;
     }[];
     const scored: { score: number; metadata: { path: string; seq: number; text: string } }[] = [];
+    let mismatchLogged = false;
     for (const row of rows) {
       const vec = decodeVector(row.embedding);
+      if (vec.length !== queryVector.length) {
+        if (!mismatchLogged) {
+          mismatchLogged = true;
+          console.warn(JSON.stringify({ vectorDimensionMismatch: { query: queryVector.length, stored: vec.length } }));
+        }
+        continue;
+      }
       const score = cosineSimilarity(queryVector, vec);
       if (score > 0) {
         scored.push({ score, metadata: { path: row.path, seq: row.seq, text: row.text } });

@@ -4,6 +4,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 
 const DAILY_MS = 24 * 60 * 60 * 1000;
+const SHUTDOWN_TIMEOUT_MS = 8_000;
 
 function toWebRequest(req: http.IncomingMessage, publicUrl: string): Request {
   const base = new URL(publicUrl);
@@ -39,15 +40,31 @@ async function sendWebResponse(res: http.ServerResponse, response: Response) {
     res.end();
     return;
   }
+
   const reader = response.body.getReader();
+  const onClose = () => {
+    void reader.cancel().catch(() => {});
+  };
+  res.on("close", onClose);
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-      if (value) res.write(value);
+      if (done || res.destroyed || res.writableEnded) break;
+      if (value) {
+        const ok = res.write(value);
+        if (!ok) {
+          await new Promise<void>((resolve) => {
+            res.once("drain", resolve);
+            res.once("close", resolve);
+          });
+        }
+      }
     }
+  } catch {
+    // Client disconnected or stream aborted
   } finally {
-    res.end();
+    res.off("close", onClose);
+    if (!res.writableEnded) res.end();
   }
 }
 
@@ -66,11 +83,11 @@ async function main() {
         res.statusCode = 500;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
       }
-      res.end("Internal server error");
+      if (!res.writableEnded) res.end("Internal server error");
     }
   });
 
-  // Daily maintenance: reconcile index + purge expired OAuth grants/tokens
+  // Daily maintenance: reconcile index + purge expired OAuth grants/tokens/clients
   const dailyTimer = setInterval(async () => {
     try {
       const purged = app.purgeExpired();
@@ -82,14 +99,30 @@ async function main() {
   }, DAILY_MS);
   dailyTimer.unref?.();
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     clearInterval(dailyTimer);
-    server.close();
-    await app.close();
-    process.exit(0);
+
+    const forceExit = setTimeout(() => {
+      console.error(JSON.stringify({ shutdown: "timed out, forcing exit" }));
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref?.();
+
+    try {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await app.close();
+      clearTimeout(forceExit);
+      process.exit(0);
+    } catch (e) {
+      console.error(JSON.stringify({ shutdownError: String(e) }));
+      process.exit(1);
+    }
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 
   server.listen(config.port, config.host, () => {
     console.log(
@@ -105,4 +138,7 @@ async function main() {
   });
 }
 
-void main();
+main().catch((e) => {
+  console.error(JSON.stringify({ startupFatal: String(e) }));
+  process.exit(1);
+});

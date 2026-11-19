@@ -9,12 +9,23 @@ import type { Change, PushOutcome, WorkingCopy } from "../writer/types.js";
 
 const execFile = promisify(execFileCb);
 
+export function redactCredentials(text: string): string {
+  return text.replace(/(https?:\/\/)([^@\s/]+)@/gi, "$1***@");
+}
+
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFile("git", ["-c", "core.quotepath=false", ...args], {
-    cwd,
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  return stdout;
+  try {
+    const { stdout } = await execFile("git", ["-c", "core.quotepath=false", ...args], {
+      cwd,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    return stdout;
+  } catch (e: any) {
+    const stderr = redactCredentials(String(e?.stderr ?? e?.message ?? e));
+    const err = new Error(stderr);
+    (err as any).stderr = stderr;
+    throw err;
+  }
 }
 
 async function gitOk(cwd: string, args: string[]): Promise<string | null> {
@@ -63,11 +74,39 @@ export class LocalGitWorkingCopy implements WorkingCopy {
   async sync(): Promise<string> {
     await ensureGitRepo(this.dir, this.authorName, this.authorEmail, this.remoteUrl);
     if (this.remoteUrl) {
-      const fetched = await gitOk(this.dir, ["fetch", "origin", "main"]);
-      if (fetched !== null) {
-        const remoteTip = await gitOk(this.dir, ["rev-parse", "--verify", "origin/main"]);
-        if (remoteTip) {
+      // Do not swallow fetch errors: confirm() relies on sync() failing if the remote is unreachable.
+      // Only ignore "couldn't find remote ref main" for a brand-new empty remote repository.
+      try {
+        await git(this.dir, ["fetch", "origin", "main"]);
+      } catch (e: any) {
+        if (!/couldn't find remote ref/i.test(String(e?.message ?? ""))) throw e;
+      }
+
+      const remoteTip = await gitOk(this.dir, ["rev-parse", "--verify", "origin/main"]);
+      const localTip = await gitOk(this.dir, ["rev-parse", "--verify", "refs/heads/main"]);
+
+      if (remoteTip) {
+        if (!localTip) {
           await git(this.dir, ["checkout", "-B", "main", "origin/main"]);
+        } else {
+          // Never drop unpushed local commits:
+          // 1. If origin/main is an ancestor of main, local is equal or ahead -> keep local main.
+          const remoteInLocal = await gitOk(this.dir, ["merge-base", "--is-ancestor", "origin/main", "refs/heads/main"]);
+          if (remoteInLocal === null) {
+            // 2. If main is an ancestor of origin/main -> fast-forward cleanly.
+            const localInRemote = await gitOk(this.dir, ["merge-base", "--is-ancestor", "refs/heads/main", "origin/main"]);
+            if (localInRemote !== null) {
+              await git(this.dir, ["merge", "--ff-only", "origin/main"]);
+            } else {
+              // 3. Diverged -> rebase local commits onto origin/main; abort cleanly on conflict.
+              try {
+                await git(this.dir, ["rebase", "origin/main"]);
+              } catch (e) {
+                await gitOk(this.dir, ["rebase", "--abort"]);
+                throw new Error(`local and remote diverged with conflicts: ${String(e)}`);
+              }
+            }
+          }
         }
       }
     }
@@ -107,12 +146,13 @@ export class LocalGitWorkingCopy implements WorkingCopy {
       }
     }
     await git(this.dir, ["add", "-A", "--", ...changes.map((c) => c.path)]);
-    const status = await git(this.dir, ["status", "--porcelain"]);
-    if (!status.trim()) {
-      const head = await gitOk(this.dir, ["rev-parse", "--verify", "refs/heads/main"]);
-      if (head) return head.trim();
+    // Check staged diff specifically (unaffected by any untracked files)
+    const head = await gitOk(this.dir, ["rev-parse", "--verify", "refs/heads/main"]);
+    if (head) {
+      const noStagedChanges = await gitOk(this.dir, ["diff", "--cached", "--quiet"]);
+      if (noStagedChanges !== null) return head.trim();
     }
-    await git(this.dir, ["commit", "--allow-empty", "-m", message]);
+    await git(this.dir, ["commit", "-m", message]);
     return (await git(this.dir, ["rev-parse", "HEAD"])).trim();
   }
 
@@ -123,13 +163,14 @@ export class LocalGitWorkingCopy implements WorkingCopy {
       return "ok";
     } catch (e: any) {
       const stderr = String(e?.stderr ?? e?.message ?? "");
-      if (/non-fast-forward|fetch first|rejected/i.test(stderr)) return "rejected";
+      if (/non-fast-forward|fetch first/i.test(stderr)) return "rejected";
       throw e;
     }
   }
 
   async contains(commit: string): Promise<boolean> {
-    const res = await gitOk(this.dir, ["merge-base", "--is-ancestor", commit, "HEAD"]);
+    const target = this.remoteUrl ? "origin/main" : "HEAD";
+    const res = await gitOk(this.dir, ["merge-base", "--is-ancestor", commit, target]);
     return res !== null;
   }
 

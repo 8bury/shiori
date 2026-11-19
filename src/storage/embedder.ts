@@ -18,6 +18,7 @@ export class OpenAiEmbedder implements Embedder {
         Authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({ model: this.model, input: texts }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -55,6 +56,7 @@ export class GeminiEmbedder implements Embedder {
           content: { parts: [{ text }] },
         })),
       }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");

@@ -42,6 +42,10 @@ export class IndexQueue {
     return Promise.resolve();
   }
 
+  private wakeIdle() {
+    for (const resolve of this.idleResolvers.splice(0)) resolve();
+  }
+
   private async pump() {
     if (this.running) return;
     this.running = true;
@@ -56,7 +60,7 @@ export class IndexQueue {
           if (job.attempt >= MAX_ATTEMPTS) {
             console.error(JSON.stringify({ alert: "index job failed after retries", body: job.message }));
             this.alerts.add("dlq", JSON.stringify(job.message));
-          } else {
+          } else if (!this.closed) {
             const nextAttempt = job.attempt + 1;
             const delay = retryDelay(job.attempt) * this.delayMultiplier;
             const timer = setTimeout(() => {
@@ -72,15 +76,16 @@ export class IndexQueue {
       }
     } finally {
       this.running = false;
-      if (this.pending.length === 0) {
-        for (const resolve of this.idleResolvers.splice(0)) resolve();
+      // Always wake waiters when pump exits (including when closed with pending items)
+      if (this.closed || this.pending.length === 0) {
+        this.wakeIdle();
       }
     }
   }
 
-  /** Wait until all currently queued (non-delayed) jobs finish. Useful in tests. */
+  /** Wait until pump is idle (all queued jobs done, or in-flight job finished after close). */
   async drain(): Promise<void> {
-    if (!this.running && this.pending.length === 0) return;
+    if (!this.running && (this.closed || this.pending.length === 0)) return;
     await new Promise<void>((resolve) => this.idleResolvers.push(resolve));
   }
 
@@ -88,5 +93,6 @@ export class IndexQueue {
     this.closed = true;
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
+    if (!this.running) this.wakeIdle();
   }
 }

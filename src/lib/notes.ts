@@ -15,7 +15,7 @@ export function checkPath(path: string) {
     p.startsWith("/") ||
     new TextEncoder().encode(p).length > 512 ||
     /[\\\u0000-\u001f\u007f]/.test(p) ||
-    p.split("/").some((seg) => seg === ".." || seg === "." || seg === "");
+    p.split("/").some((seg) => seg === ".." || seg === "." || seg === "" || seg.startsWith("."));
   if (bad) throw new Error(`Invalid path: ${path} (use something like projetos/name.md)`);
   return p;
 }

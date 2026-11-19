@@ -19,6 +19,7 @@ COPY --from=builder /app/dist ./dist
 
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node
+RUN git config --global --add safe.directory /data/notes
 
 EXPOSE 3000
 VOLUME ["/data"]

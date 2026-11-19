@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import dns from "node:dns/promises";
+import net from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../config.js";
 
@@ -7,6 +9,10 @@ const SESSION_TTL_SEC = 600; // 10 minutes
 const AUTH_CODE_TTL_SEC = 300; // 5 minutes
 const ACCESS_TOKEN_TTL_SEC = 3600; // 1 hour
 const REFRESH_TOKEN_IDLE_TTL_SEC = 30 * 24 * 3600; // 30 days
+const CIMD_CACHE_TTL_SEC = 3600; // 1 hour
+const MAX_CIMD_BYTES = 8 * 1024;
+const MAX_REGISTER_BYTES = 8 * 1024;
+const MAX_REDIRECT_URIS = 10;
 
 export interface VerifiedToken {
   token: string;
@@ -39,6 +45,10 @@ interface AuthRequestPayload {
   githubVerifier?: string;
 }
 
+/**
+ * Exact-origin + path-prefix allowlist (prevents https://muse.app matching https://muse.app.evil.com).
+ * Loopback hosts (localhost, 127.0.0.1, [::1]) are always allowed per RFC 8252.
+ */
 export function redirectAllowed(uri: string, allowedPrefixes: string[], allowAllHttps = false): boolean {
   let u: URL;
   try {
@@ -48,8 +58,39 @@ export function redirectAllowed(uri: string, allowedPrefixes: string[], allowAll
   }
   if (LOOPBACK.has(u.hostname)) return true;
   if (allowAllHttps && u.protocol === "https:") return true;
-  const normalized = `${u.origin}${u.pathname}`;
-  return allowedPrefixes.some((p) => normalized.startsWith(p));
+  return allowedPrefixes.some((p) => {
+    try {
+      const prefix = new URL(p);
+      if (u.origin !== prefix.origin) return false;
+      return prefix.pathname === "/" || u.pathname.startsWith(prefix.pathname);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Rejects loopback, private, link-local, CGNAT, and metadata IP addresses (SSRF protection for CIMD). */
+export function isPrivateIp(ip: string): boolean {
+  const clean = ip.replace(/^::ffff:/i, "");
+  if (net.isIPv4(clean)) {
+    const [a, b] = clean.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT / Tailscale
+    if (a === 169 && b === 254) return true; // link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a >= 224) return true; // multicast / reserved
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const low = ip.toLowerCase();
+    if (low === "::" || low === "::1") return true;
+    if (low.startsWith("fc") || low.startsWith("fd")) return true; // ULA
+    if (low.startsWith("fe8") || low.startsWith("fe9") || low.startsWith("fea") || low.startsWith("feb")) return true; // link-local
+    if (low.startsWith("ff")) return true; // multicast
+    return false;
+  }
+  return true;
 }
 
 function sha256Hex(value: string): string {
@@ -129,7 +170,32 @@ ${isLoopback ? "<p><strong>This sends access to an app on this computer.</strong
 <button name="decision" value="approve">Continue with GitHub</button><button name="decision" value="deny">Cancel</button></form>`;
 }
 
+async function readTextCapped(res: Response, maxBytes: number): Promise<string | null> {
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export class OAuthServer {
+  private readonly cimdCache = new Map<string, { record: ClientRecord; expiresAt: number }>();
+
   constructor(
     private readonly db: DatabaseSync,
     private readonly config: Pick<
@@ -139,10 +205,20 @@ export class OAuthServer {
     private readonly fetcher: typeof fetch = fetch,
   ) {}
 
+  private expectedResource(): string {
+    return `${this.config.publicUrl}/mcp`;
+  }
+
+  private isValidResource(resource: string | null): boolean {
+    if (!resource) return true;
+    const norm = resource.replace(/\/+$/, "");
+    return norm === this.expectedResource() || norm === this.config.publicUrl;
+  }
+
   protectedResourceMetadata(): Response {
     return Response.json(
       {
-        resource: `${this.config.publicUrl}/mcp`,
+        resource: this.expectedResource(),
         authorization_servers: [this.config.publicUrl],
         scopes_supported: ["mcp"],
         bearer_methods_supported: ["header"],
@@ -186,17 +262,22 @@ export class OAuthServer {
 
   async register(req: Request): Promise<Response> {
     if (req.method !== "POST") return plain("Method not allowed", 405);
+    const raw = await req.text();
+    if (Buffer.byteLength(raw, "utf8") > MAX_REGISTER_BYTES) {
+      return jsonError("invalid_client_metadata", "Registration payload too large", 413);
+    }
     let body: Record<string, unknown>;
     try {
-      body = (await req.json()) as Record<string, unknown>;
+      body = JSON.parse(raw) as Record<string, unknown>;
     } catch {
       return jsonError("invalid_client_metadata", "Request body must be valid JSON");
     }
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u): u is string => typeof u === "string") : [];
-    if (!redirectUris.length) {
-      return jsonError("invalid_redirect_uri", "redirect_uris must be a non-empty array of URLs");
+    if (!redirectUris.length || redirectUris.length > MAX_REDIRECT_URIS) {
+      return jsonError("invalid_redirect_uri", `redirect_uris must contain 1..${MAX_REDIRECT_URIS} URLs`);
     }
     for (const uri of redirectUris) {
+      if (uri.length > 512) return jsonError("invalid_redirect_uri", "Redirect URI too long");
       try {
         const u = new URL(uri);
         if (u.protocol !== "https:" && !LOOPBACK.has(u.hostname)) {
@@ -236,7 +317,7 @@ export class OAuthServer {
     );
   }
 
-  private async resolveClient(clientId: string): Promise<ClientRecord | null> {
+  private lookupStoredClient(clientId: string): ClientRecord | null {
     const row = this.db
       .prepare("SELECT client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method FROM oauth_clients WHERE client_id = ?")
       .get(clientId) as
@@ -249,44 +330,69 @@ export class OAuthServer {
         }
       | undefined;
 
-    if (row) {
-      return {
-        clientId: row.client_id,
-        clientName: row.client_name,
-        redirectUris: JSON.parse(row.redirect_uris) as string[],
-        tokenEndpointAuthMethod: row.token_endpoint_auth_method,
-        clientSecretHash: row.client_secret_hash,
+    if (!row) return null;
+    return {
+      clientId: row.client_id,
+      clientName: row.client_name,
+      clientDomain: row.client_id.startsWith("https://") ? new URL(row.client_id).host : undefined,
+      redirectUris: JSON.parse(row.redirect_uris) as string[],
+      tokenEndpointAuthMethod: row.token_endpoint_auth_method,
+      clientSecretHash: row.client_secret_hash,
+    };
+  }
+
+  private async resolveClient(clientId: string, allowNetwork = true): Promise<ClientRecord | null> {
+    const stored = this.lookupStoredClient(clientId);
+    if (stored) return stored;
+
+    if (!clientId.startsWith("https://")) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const cached = this.cimdCache.get(clientId);
+    if (cached && cached.expiresAt > now) return cached.record;
+    if (!allowNetwork) return null;
+
+    // Client ID Metadata Document (CIMD) with SSRF, redirect, and size protections
+    try {
+      const u = new URL(clientId);
+      if (u.protocol !== "https:" || u.pathname === "/" || u.pathname === "" || u.username || u.password) return null;
+      if (LOOPBACK.has(u.hostname)) return null;
+      const addrs = await dns.lookup(u.hostname, { all: true });
+      if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) return null;
+
+      const res = await this.fetcher(clientId, {
+        headers: { Accept: "application/json", "User-Agent": "second-brain-mcp" },
+        redirect: "error",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return null;
+      const text = await readTextCapped(res, MAX_CIMD_BYTES);
+      if (!text) return null;
+      const doc = JSON.parse(text) as { client_id?: string; client_name?: string; redirect_uris?: unknown };
+      if (doc.client_id !== clientId) return null;
+      const uris = Array.isArray(doc.redirect_uris)
+        ? doc.redirect_uris.filter((x): x is string => typeof x === "string").slice(0, MAX_REDIRECT_URIS)
+        : [];
+      if (!uris.length) return null;
+
+      const record: ClientRecord = {
+        clientId,
+        clientName: typeof doc.client_name === "string" && doc.client_name.trim() ? doc.client_name.trim().slice(0, 120) : u.host,
+        clientDomain: u.host,
+        redirectUris: uris,
+        tokenEndpointAuthMethod: "none",
+        clientSecretHash: null,
       };
+      this.cimdCache.set(clientId, { record, expiresAt: now + CIMD_CACHE_TTL_SEC });
+      // Persist in oauth_clients so /token never depends on live CIMD availability
+      this.db
+        .prepare(
+          "INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, created_at) VALUES (?, NULL, ?, ?, 'none', ?) ON CONFLICT(client_id) DO UPDATE SET client_name = excluded.client_name, redirect_uris = excluded.redirect_uris",
+        )
+        .run(record.clientId, record.clientName, JSON.stringify(record.redirectUris), now);
+      return record;
+    } catch {
+      return null;
     }
-
-    // Client ID Metadata Document (CIMD): https:// URL pointing to client metadata JSON
-    if (clientId.startsWith("https://")) {
-      try {
-        const u = new URL(clientId);
-        if (u.pathname === "/" || u.pathname === "") return null;
-        const res = await this.fetcher(clientId, {
-          headers: { Accept: "application/json", "User-Agent": "second-brain-mcp" },
-          signal: AbortSignal.timeout(5000),
-        });
-        if (!res.ok) return null;
-        const doc = (await res.json()) as { client_id?: string; client_name?: string; redirect_uris?: unknown };
-        if (doc.client_id !== clientId) return null;
-        const uris = Array.isArray(doc.redirect_uris) ? doc.redirect_uris.filter((x): x is string => typeof x === "string") : [];
-        if (!uris.length) return null;
-        return {
-          clientId,
-          clientName: typeof doc.client_name === "string" && doc.client_name.trim() ? doc.client_name.trim() : u.host,
-          clientDomain: u.host,
-          redirectUris: uris,
-          tokenEndpointAuthMethod: "none",
-          clientSecretHash: null,
-        };
-      } catch {
-        return null;
-      }
-    }
-
-    return null;
   }
 
   async authorize(req: Request): Promise<Response> {
@@ -296,13 +402,13 @@ export class OAuthServer {
       const redirectUri = url.searchParams.get("redirect_uri") ?? "";
       const responseType = url.searchParams.get("response_type") ?? "";
       const state = url.searchParams.get("state");
-      const scope = url.searchParams.get("scope") ?? "mcp";
+      const rawScope = url.searchParams.get("scope") ?? "mcp";
       const codeChallenge = url.searchParams.get("code_challenge") ?? "";
       const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "";
       const resource = url.searchParams.get("resource");
 
       if (!clientId || !redirectUri) return plain("Missing client_id or redirect_uri", 400);
-      const client = await this.resolveClient(clientId);
+      const client = await this.resolveClient(clientId, true);
       if (!client) return plain("Unknown client_id", 400);
       if (!client.redirectUris.includes(redirectUri)) return plain("redirect_uri is not registered for this client", 400);
 
@@ -315,6 +421,14 @@ export class OAuthServer {
       if (!codeChallenge || codeChallengeMethod !== "S256") {
         return redirectWithError(redirectUri, "invalid_request", state, "PKCE S256 is required");
       }
+      if (!this.isValidResource(resource)) {
+        return redirectWithError(redirectUri, "invalid_target", state, "Invalid resource parameter");
+      }
+
+      // Limit granted scope strictly to "mcp"
+      const requestedScopes = rawScope.split(/\s+/).filter(Boolean);
+      const scope = requestedScopes.length === 0 || requestedScopes.includes("mcp") ? "mcp" : "";
+      if (!scope) return redirectWithError(redirectUri, "invalid_scope", state, "Only scope 'mcp' is supported");
 
       const handle = randomToken(24);
       const cookieVal = randomToken(24);
@@ -328,7 +442,7 @@ export class OAuthServer {
         scope,
         codeChallenge,
         codeChallengeMethod,
-        resource,
+        resource: resource ? this.expectedResource() : null,
       };
       this.db
         .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'consent', ?, ?, ?)")
@@ -411,6 +525,7 @@ export class OAuthServer {
         redirect_uri: `${this.config.publicUrl}/callback`,
         code_verifier: session.githubVerifier,
       }),
+      signal: AbortSignal.timeout(10_000),
     });
     const tokenJson = tokenRes.ok ? ((await tokenRes.json().catch(() => null)) as { access_token?: string; error?: string } | null) : null;
     if (!tokenJson?.access_token) {
@@ -423,6 +538,7 @@ export class OAuthServer {
         Accept: "application/vnd.github+json",
         "User-Agent": "second-brain-mcp",
       },
+      signal: AbortSignal.timeout(10_000),
     });
     const user = userRes.ok ? ((await userRes.json().catch(() => null)) as { id: number; login: string } | null) : null;
     if (!user) return plain("Couldn't read your GitHub account. Start again from your app.", 502);
@@ -464,7 +580,6 @@ export class OAuthServer {
     const params = await this.parseTokenBody(req);
     if (!params) return jsonError("invalid_request", "Could not parse token request body");
 
-    // Extract client credentials from Basic auth or form body
     let clientId = params.get("client_id") ?? "";
     let clientSecret = params.get("client_secret") ?? "";
     const authHeader = req.headers.get("authorization") ?? "";
@@ -491,8 +606,8 @@ export class OAuthServer {
     return jsonError("unsupported_grant_type", `Unsupported grant_type: ${grantType ?? ""}`);
   }
 
-  private async verifyClientAuth(clientId: string, clientSecret: string): Promise<boolean> {
-    const client = await this.resolveClient(clientId);
+  private verifyClientAuthSync(clientId: string, clientSecret: string): boolean {
+    const client = this.lookupStoredClient(clientId);
     if (!client) return false;
     if (client.tokenEndpointAuthMethod === "none") return true;
     if (!client.clientSecretHash || !clientSecret) return false;
@@ -501,7 +616,7 @@ export class OAuthServer {
     return given.length === expected.length && crypto.timingSafeEqual(given, expected);
   }
 
-  private async exchangeAuthCode(params: URLSearchParams, clientId: string, clientSecret: string): Promise<Response> {
+  private exchangeAuthCode(params: URLSearchParams, clientId: string, clientSecret: string): Response {
     const code = params.get("code") ?? "";
     const redirectUri = params.get("redirect_uri") ?? "";
     const codeVerifier = params.get("code_verifier") ?? "";
@@ -510,7 +625,7 @@ export class OAuthServer {
     const codeHash = sha256Hex(code);
     const row = this.db
       .prepare(
-        "SELECT client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, resource, metadata, expires_at FROM oauth_auth_codes WHERE code_hash = ?",
+        "DELETE FROM oauth_auth_codes WHERE code_hash = ? RETURNING client_id, user_id, redirect_uri, scope, code_challenge, code_challenge_method, resource, metadata, expires_at",
       )
       .get(codeHash) as
       | {
@@ -526,14 +641,11 @@ export class OAuthServer {
         }
       | undefined;
 
-    // Single-use: always delete immediately
-    this.db.prepare("DELETE FROM oauth_auth_codes WHERE code_hash = ?").run(codeHash);
-
     const now = Math.floor(Date.now() / 1000);
     if (!row || row.expires_at < now) return jsonError("invalid_grant", "Authorization code is invalid or expired");
     if (clientId && clientId !== row.client_id) return jsonError("invalid_grant", "client_id mismatch");
     const effectiveClientId = clientId || row.client_id;
-    if (!(await this.verifyClientAuth(effectiveClientId, clientSecret))) {
+    if (!this.verifyClientAuthSync(effectiveClientId, clientSecret)) {
       return jsonError("invalid_client", "Client authentication failed", 401);
     }
     if (redirectUri && redirectUri !== row.redirect_uri) return jsonError("invalid_grant", "redirect_uri mismatch");
@@ -551,13 +663,14 @@ export class OAuthServer {
     return this.issueTokens(grantId, row.client_id, row.user_id, row.scope, row.resource, now);
   }
 
-  private async exchangeRefreshToken(params: URLSearchParams, clientId: string, clientSecret: string): Promise<Response> {
+  private exchangeRefreshToken(params: URLSearchParams, clientId: string, clientSecret: string): Response {
     const refreshToken = params.get("refresh_token") ?? "";
     if (!refreshToken) return jsonError("invalid_request", "Missing refresh_token");
     const tokenHash = sha256Hex(refreshToken);
 
+    // Atomically consume the refresh token first so two concurrent refreshes cannot both succeed
     const row = this.db
-      .prepare("SELECT grant_id, client_id, user_id, scope, resource, expires_at FROM oauth_tokens WHERE token_hash = ? AND token_type = 'refresh'")
+      .prepare("DELETE FROM oauth_tokens WHERE token_hash = ? AND token_type = 'refresh' RETURNING grant_id, client_id, user_id, scope, resource, expires_at")
       .get(tokenHash) as
       | { grant_id: string; client_id: string; user_id: string; scope: string; resource: string | null; expires_at: number }
       | undefined;
@@ -565,12 +678,10 @@ export class OAuthServer {
     const now = Math.floor(Date.now() / 1000);
     if (!row || row.expires_at < now) return jsonError("invalid_grant", "Refresh token is invalid or expired");
     if (clientId && clientId !== row.client_id) return jsonError("invalid_grant", "client_id mismatch");
-    if (!(await this.verifyClientAuth(row.client_id, clientSecret))) {
+    if (!this.verifyClientAuthSync(row.client_id, clientSecret)) {
       return jsonError("invalid_client", "Client authentication failed", 401);
     }
 
-    // Rotate refresh token and extend grant idle TTL
-    this.db.prepare("DELETE FROM oauth_tokens WHERE token_hash = ?").run(tokenHash);
     this.db
       .prepare("UPDATE oauth_grants SET last_used_at = ?, expires_at = ? WHERE id = ?")
       .run(now, now + REFRESH_TOKEN_IDLE_TTL_SEC, row.grant_id);
@@ -611,6 +722,7 @@ export class OAuthServer {
       | { client_id: string; user_id: string; scope: string; resource: string | null; expires_at: number }
       | undefined;
     if (!row || row.expires_at <= now) return null;
+    if (!this.isValidResource(row.resource)) return null;
     return {
       token,
       clientId: row.client_id,
@@ -632,13 +744,20 @@ export class OAuthServer {
     return Number(res.changes) > 0;
   }
 
-  purgeExpired(): { sessions: number; codes: number; tokens: number; grants: number } {
+  purgeExpired(): { sessions: number; codes: number; tokens: number; grants: number; clients: number } {
     const now = Math.floor(Date.now() / 1000);
     const sessions = Number(this.db.prepare("DELETE FROM oauth_sessions WHERE expires_at < ?").run(now).changes);
     const codes = Number(this.db.prepare("DELETE FROM oauth_auth_codes WHERE expires_at < ?").run(now).changes);
     const tokens = Number(this.db.prepare("DELETE FROM oauth_tokens WHERE expires_at < ?").run(now).changes);
     const grants = Number(this.db.prepare("DELETE FROM oauth_grants WHERE expires_at < ?").run(now).changes);
-    return { sessions, codes, tokens, grants };
+    // Remove orphaned clients older than 30 days with no active grants
+    const cutoff = now - REFRESH_TOKEN_IDLE_TTL_SEC;
+    const clients = Number(
+      this.db
+        .prepare("DELETE FROM oauth_clients WHERE created_at < ? AND client_id NOT IN (SELECT DISTINCT client_id FROM oauth_grants)")
+        .run(cutoff).changes,
+    );
+    return { sessions, codes, tokens, grants, clients };
   }
 
   private consumeSession(req: Request, handle: string, kind: "consent" | "github"): AuthRequestPayload | null {
@@ -647,9 +766,8 @@ export class OAuthServer {
     const cookieVal = cookies.get(cookieName(this.config.publicUrl));
     if (!cookieVal) return null;
     const row = this.db
-      .prepare("SELECT cookie_hash, payload, expires_at FROM oauth_sessions WHERE handle = ? AND kind = ?")
+      .prepare("DELETE FROM oauth_sessions WHERE handle = ? AND kind = ? RETURNING cookie_hash, payload, expires_at")
       .get(handle, kind) as { cookie_hash: string; payload: string; expires_at: number } | undefined;
-    this.db.prepare("DELETE FROM oauth_sessions WHERE handle = ?").run(handle);
     const now = Math.floor(Date.now() / 1000);
     if (!row || row.expires_at < now) return null;
     const given = Buffer.from(sha256Hex(cookieVal), "hex");
