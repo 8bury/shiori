@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 340" width="880" height="340" role="img" aria-label="Shiori OAuth 2.1 sign-in flow">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <rect width="880" height="340" rx="14" fill="#0f172a" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="28" y="34" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="16" font-weight="700">OAuth 2.1 Sign-In Flow</text>
+  <text x="28" y="52" fill="#94a3b8" font-family="system-ui, -apple-system, sans-serif" font-size="12">PKCE S256, redirect allowlist, CSRF binding cookie, GitHub owner check, and rotating refresh tokens</text>
+
+  <!-- Actors -->
+  <g font-family="system-ui, -apple-system, sans-serif" font-size="12.5" font-weight="700" text-anchor="middle">
+    <rect x="44" y="72" width="160" height="34" rx="8" fill="#1e293b" stroke="#3b82f6"/>
+    <text x="124" y="93" fill="#f8fafc">AI Client</text>
+
+    <rect x="360" y="72" width="160" height="34" rx="8" fill="#1e293b" stroke="#10b981"/>
+    <text x="440" y="93" fill="#f8fafc">Shiori Server</text>
+
+    <rect x="676" y="72" width="160" height="34" rx="8" fill="#1e293b" stroke="#f59e0b"/>
+    <text x="756" y="93" fill="#f8fafc">GitHub OAuth</text>
+  </g>
+
+  <!-- Lifelines -->
+  <g stroke="#334155" stroke-width="1.5" stroke-dasharray="4 4">
+    <line x1="124" y1="106" x2="124" y2="318"/>
+    <line x1="440" y1="106" x2="440" y2="318"/>
+    <line x1="756" y1="106" x2="756" y2="318"/>
+  </g>
+
+  <!-- Steps -->
+  <g font-family="ui-monospace, SFMono-Regular, monospace" font-size="11">
+    <!-- 1 -->
+    <line x1="124" y1="132" x2="434" y2="132" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="282" y="125" text-anchor="middle" fill="#cbd5e1">1. POST /mcp -> 401 + resource_metadata</text>
+
+    <!-- 2 -->
+    <line x1="124" y1="162" x2="434" y2="162" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="282" y="155" text-anchor="middle" fill="#cbd5e1">2. POST /register (or SSRF-checked CIMD)</text>
+
+    <!-- 3 -->
+    <line x1="124" y1="192" x2="434" y2="192" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="282" y="185" text-anchor="middle" fill="#cbd5e1">3. GET/POST /authorize (allowlist + consent)</text>
+
+    <!-- 4 -->
+    <line x1="440" y1="222" x2="750" y2="222" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="598" y="215" text-anchor="middle" fill="#fbbf24">4. Redirect to GitHub (PKCE + cookie)</text>
+
+    <!-- 5 -->
+    <line x1="756" y1="252" x2="446" y2="252" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="598" y="245" text-anchor="middle" fill="#fbbf24">5. GET /callback -> verify OWNER_GITHUB_ID</text>
+
+    <!-- 6 -->
+    <line x1="124" y1="282" x2="434" y2="282" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="282" y="275" text-anchor="middle" fill="#cbd5e1">6. POST /token (PKCE S256 -> access + refresh)</text>
+
+    <!-- 7 -->
+    <line x1="124" y1="310" x2="434" y2="310" stroke="#34d399" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="282" y="303" text-anchor="middle" fill="#6ee7b7">7. Authenticated POST /mcp (Bearer token)</text>
+  </g>
+</svg>

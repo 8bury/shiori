@@ -1,30 +1,46 @@
-# Architecture (v2)
+# Shiori Architecture
 
-| Concern | How | Decision |
+![Shiori Architecture](docs/diagrams/architecture.svg)
+
+| Concern | How | Module |
 |---|---|---|
-| Where notes live | Cloudflare **Artifacts** (Git), read through a binding | [ADR 007](docs/adr/007-cloudflare-artifacts-for-the-notes.md) |
-| Writes | One **Durable Object per repository**: in-memory mutex, operation applied inside the lock, retried on the new tip if another push landed first, confirmed before reporting a failure | [ADR 008](docs/adr/008-one-durable-object-per-repository.md) |
-| Indexing | A **Queue**: the only writer of the index, retries and a dead-letter queue, records what it indexed in a **D1 manifest** | [ADR 009](docs/adr/009-queue-for-indexing-workflow-for-reconciliation.md), [ADR 010](docs/adr/010-index-manifest-in-d1.md) |
-| Repair | A daily **Workflow** compares notes and index and enqueues fixes; also a full rebuild | [ADR 009](docs/adr/009-queue-for-indexing-workflow-for-reconciliation.md) |
-| Search | **D1 FTS5** (keyword) + **Vectorize** (meaning, Workers AI bge-m3), fused by reciprocal rank, in one tool (`search_notes`) | [ADR 002](docs/adr/002-semantic-search-with-workers-ai-and-vectorize.md), [ADR 012](docs/adr/012-hybrid-search-with-d1-fts5.md), [ADR 015](docs/adr/015-one-search-tool.md) |
-| Access | **OAuth 2.1** (`workers-oauth-provider`), consent page, GitHub sign-in restricted to the owner | [ADR 011](docs/adr/011-oauth-with-github-login.md) |
-| Clients | Every client, Claude Code on the Mac included, reads and writes only through MCP; an optional read-only mirror for viewing | [ADR 014](docs/adr/014-mcp-only-clients.md) |
-| Infrastructure | `wrangler.jsonc` + an idempotent setup script; deploy on merge | [ADR 006](docs/adr/006-wrangler-and-a-setup-script-instead-of-terraform.md) |
+| Runtime | Single **Node 24** HTTP server (Docker / Coolify) behind Traefik TLS | [src/index.ts](src/index.ts), [src/app.ts](src/app.ts) |
+| Episodic Memory | Append-only `memory_log` + power-of-2 binary summary tree (`memory_tree`) in SQLite, plus `/data/memory.log` | [src/memory/tree.ts](src/memory/tree.ts) |
+| Notes Storage | Local **Git** repository in `/data/notes` (optional backup push to a private remote) | [src/storage/git.ts](src/storage/git.ts) |
+| Concurrency | In-process `Writer` mutex with optimistic `expected_version` checks | [src/writer/writer.ts](src/writer/writer.ts) |
+| Indexing | Sequential in-process `IndexQueue` with exponential retry backoff and DLQ alerts | [src/queue.ts](src/queue.ts), [src/indexer/indexer.ts](src/indexer/indexer.ts) |
+| Repair | Daily reconciliation job compares Git HEAD against SQLite manifest/FTS5/vectors | [src/reconcile/reconcile.ts](src/reconcile/reconcile.ts) |
+| Search | **SQLite FTS5** (BM25 keyword) + **API embeddings** (OpenAI or Gemini) cosine similarity, fused via Reciprocal Rank Fusion | [src/search/hybrid.ts](src/search/hybrid.ts), [src/storage/sqlite-adapters.ts](src/storage/sqlite-adapters.ts) |
+| Access | **OAuth 2.1** authorization server in SQLite, consent page, PKCE S256, SSRF-checked CIMD, redirect allowlist, GitHub owner check | [src/auth/oauth.ts](src/auth/oauth.ts) |
 
-**Limits of this design.** All writes to one repository go through one Durable Object, about two writes per second from the spike's measurements; a team would shard by repository ([at scale](docs/design/at-scale.md)). A missed push event waits for the daily reconciliation, so the index can lag by up to a day, never stay wrong.
+## Binary-Tree Episodic Memory
 
-## Repository
+![Binary-Tree Episodic Memory](docs/diagrams/memory-tree.svg)
 
-```
+## OAuth 2.1 Sign-In Flow
+
+![OAuth 2.1 Sign-In Flow](docs/diagrams/oauth-flow.svg)
+
+## Note Writes & Hybrid Search Pipelines
+
+![Note Writes and Hybrid Search Pipelines](docs/diagrams/write-and-search.svg)
+
+## Repository Layout
+
+```text
 src/
-  index.ts            Worker: OAuth wrapper, MCP tools, admin routes, queue handler
-  auth/github.ts      consent page, GitHub sign-in, owner check
-  writer/             RepoWriter Durable Object, Artifacts working copy (isomorphic-git)
-  indexer/            queue consumer logic and adapters (Artifacts, D1, Vectorize, Workers AI)
-  reconcile/          reconciliation Workflow
-  search/hybrid.ts    FTS5 query building and rank fusion
-migrations/           D1 schema
-scripts/              setup, secrets, read-only mirror, measurements
-test/                 Vitest (inside workerd) and shell tests for the scripts
-docs/                 PRDs, specs, ADRs, architecture maps, measurements, design notes
+  index.ts            Node HTTP server, streaming responses, daily maintenance, graceful shutdown
+  app.ts              MCP tool registration, OAuth/admin/health routing
+  config.ts           Environment variable loader and defaults
+  queue.ts            In-process sequential indexing queue with retry backoff
+  auth/oauth.ts       OAuth 2.1 authorization server + GitHub owner login
+  memory/             Binary-tree episodic memory engine and agent prompt
+  writer/             Serialized Git writer and optimistic version hashing
+  indexer/            Chunking, FTS5 + vector indexing logic
+  reconcile/          Daily diff/repair and full rebuild orchestration
+  search/hybrid.ts    FTS5 query builder and Reciprocal Rank Fusion
+  storage/            node:sqlite DB, FTS5/vector adapters, Git CLI working copy, embedders
+docs/
+  diagrams/           SVG architecture and flow diagrams
+test/                 Vitest unit and end-to-end tests
 ```

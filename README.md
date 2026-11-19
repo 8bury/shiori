@@ -14,11 +14,17 @@
 
 ## How it works
 
+![Shiori Architecture](docs/diagrams/architecture.svg)
+
 Shiori runs as a single lightweight **Node 24 + SQLite + Git** container with two complementary layers:
 
 1. **Episodic Memory Tree:** An append-only timeline of 1-line facts, preferences, and decisions, organized into a binary tree of summaries. When any agent starts a session (`memory_wake`), it gets recent memories verbatim and older memories exponentially compressed inside a fixed token budget, and can drill down (`memory_zoom`) or search (`memory_recall`) anytime.
 2. **Long-form Notes:** Editable Markdown documents backed by a real Git repository (every edit is a commit, nothing is ever lost) with hybrid search combining SQLite FTS5 keywords and API embeddings (OpenAI, Gemini, or keyword-only).
 3. **Zero-trust OAuth 2.1:** Every client authenticates via OAuth 2.1 + GitHub sign-in restricted to your numeric `OWNER_GITHUB_ID`, with a consent screen, PKCE S256, redirect allowlist, and per-client grant revocation.
+
+![Binary-Tree Episodic Memory](docs/diagrams/memory-tree.svg)
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the OAuth 2.1 and hybrid search flow diagrams.
 
 ## Quick start (Coolify / Docker)
 
