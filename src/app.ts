@@ -22,6 +22,7 @@ import { SqliteAlerts, SqliteKeywords, SqliteManifest, SqliteReconcileIndex, Sql
 import type { Operation, WriteResult } from "./writer/types.js";
 import { noteVersion } from "./writer/version.js";
 import { Writer } from "./writer/writer.js";
+import { handleWeb } from "./web/ui.js";
 
 const SEMANTIC_FLOOR = 0.3;
 
@@ -114,7 +115,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
   const IDEMPOTENT_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
   const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } as const;
 
-  async function searchNotes(query: string, limit: number): Promise<string> {
+  async function searchNotesRaw(query: string, limit: number) {
     const fts = buildFtsQuery(query);
     const [keyword, semantic] = await Promise.all([
       Promise.resolve()
@@ -127,8 +128,16 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
         return semanticHits(matches, SEMANTIC_FLOOR);
       })().catch((e) => (console.error(JSON.stringify({ semanticSearchFailed: String(e) })), null)),
     ]);
-    if (keyword === null && semantic === null) return "Note search is unavailable right now. Try again in a moment.";
-    const results = fuse(keyword ?? [], semantic ?? [], limit);
+    if (keyword === null && semantic === null) return null;
+    return { results: fuse(keyword ?? [], semantic ?? [], limit), keywordFailed: keyword === null, semanticFailed: semantic === null };
+  }
+
+  async function searchNotes(query: string, limit: number): Promise<string> {
+    const raw = await searchNotesRaw(query, limit);
+    if (!raw) return "Note search is unavailable right now. Try again in a moment.";
+    const { results } = raw;
+    const semantic = raw.semanticFailed ? null : [];
+    const keyword = raw.keywordFailed ? null : [];
     const lines = results.map((r) => `${r.path} (${r.matched})\n${r.text.slice(0, 400)}`);
     const note =
       semantic === null
@@ -382,6 +391,10 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     }
     if (pathname === "/token") {
       return oauth.token(request);
+    }
+
+    if (pathname === "/ui" || pathname.startsWith("/ui/")) {
+      return handleWeb(request, { oauth, db, memory, notesSource, searchNotes: searchNotesRaw });
     }
 
     if (pathname === "/mcp") {

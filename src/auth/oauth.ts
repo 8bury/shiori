@@ -43,6 +43,19 @@ interface AuthRequestPayload {
   codeChallengeMethod: string;
   resource: string | null;
   githubVerifier?: string;
+  /** Set when this GitHub sign-in is for the web viewer (/ui) instead of an MCP client. */
+  web?: boolean;
+}
+
+const WEB_SESSION_TTL_SEC = 7 * 24 * 3600; // 7 days
+
+function webCookieName(publicUrl: string): string {
+  return publicUrl.startsWith("https://") ? "__Host-shiori_web" : "shiori_web";
+}
+
+function setWebCookieHeader(publicUrl: string, value: string, maxAge: number): string {
+  const secure = publicUrl.startsWith("https://") ? "; Secure" : "";
+  return `${webCookieName(publicUrl)}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
 /**
@@ -479,23 +492,64 @@ export class OAuthServer {
         .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'github', ?, ?, ?)")
         .run(ghState, sha256Hex(cookieVal), JSON.stringify(nextPayload), now + SESSION_TTL_SEC);
 
-      const gh = new URL("https://github.com/login/oauth/authorize");
-      gh.search = new URLSearchParams({
-        client_id: this.config.githubClientId,
-        redirect_uri: `${this.config.publicUrl}/callback`,
-        state: ghState,
-        scope: "",
-        code_challenge: s256(verifier),
-        code_challenge_method: "S256",
-        allow_signup: "false",
-      }).toString();
-
-      const headers = new Headers({ Location: gh.toString(), "Cache-Control": "no-store" });
+      const headers = new Headers({ Location: this.githubAuthorizeUrl(ghState, verifier), "Cache-Control": "no-store" });
       headers.append("Set-Cookie", setCookieHeader(this.config.publicUrl, cookieVal, SESSION_TTL_SEC));
       return new Response(null, { status: 302, headers });
     }
 
     return plain("Method not allowed", 405);
+  }
+
+  /** Starts a GitHub sign-in for the web viewer. */
+  webLogin(): Response {
+    if (!this.config.githubClientId || !this.config.githubClientSecret || !this.config.ownerGithubId) {
+      return plain("Server OAuth is not configured (missing GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, or OWNER_GITHUB_ID).", 500);
+    }
+    const ghState = randomToken(24);
+    const cookieVal = randomToken(24);
+    const verifier = randomToken(32);
+    const now = Math.floor(Date.now() / 1000);
+    const payload = { web: true, githubVerifier: verifier } as AuthRequestPayload;
+    this.db
+      .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'github', ?, ?, ?)")
+      .run(ghState, sha256Hex(cookieVal), JSON.stringify(payload), now + SESSION_TTL_SEC);
+    const headers = new Headers({ Location: this.githubAuthorizeUrl(ghState, verifier), "Cache-Control": "no-store" });
+    headers.append("Set-Cookie", setCookieHeader(this.config.publicUrl, cookieVal, SESSION_TTL_SEC));
+    return new Response(null, { status: 302, headers });
+  }
+
+  /** Returns the GitHub user id if the request carries a valid web viewer session. */
+  verifyWebSession(req: Request): string | null {
+    const cookieVal = parseCookies(req).get(webCookieName(this.config.publicUrl));
+    if (!cookieVal) return null;
+    const row = this.db
+      .prepare("SELECT payload, expires_at FROM oauth_sessions WHERE handle = ? AND kind = 'web'")
+      .get(sha256Hex(cookieVal)) as { payload: string; expires_at: number } | undefined;
+    if (!row || row.expires_at < Math.floor(Date.now() / 1000)) return null;
+    const { userId } = JSON.parse(row.payload) as { userId: string };
+    return userId === this.config.ownerGithubId ? userId : null;
+  }
+
+  webLogout(req: Request): Response {
+    const cookieVal = parseCookies(req).get(webCookieName(this.config.publicUrl));
+    if (cookieVal) this.db.prepare("DELETE FROM oauth_sessions WHERE handle = ? AND kind = 'web'").run(sha256Hex(cookieVal));
+    const headers = new Headers({ Location: "/ui", "Cache-Control": "no-store" });
+    headers.append("Set-Cookie", setWebCookieHeader(this.config.publicUrl, "", 0));
+    return new Response(null, { status: 303, headers });
+  }
+
+  private githubAuthorizeUrl(ghState: string, verifier: string): string {
+    const gh = new URL("https://github.com/login/oauth/authorize");
+    gh.search = new URLSearchParams({
+      client_id: this.config.githubClientId,
+      redirect_uri: `${this.config.publicUrl}/callback`,
+      state: ghState,
+      scope: "",
+      code_challenge: s256(verifier),
+      code_challenge_method: "S256",
+      allow_signup: "false",
+    }).toString();
+    return gh.toString();
   }
 
   async callback(req: Request): Promise<Response> {
@@ -510,6 +564,7 @@ export class OAuthServer {
     const clearCookie = setCookieHeader(this.config.publicUrl, "", 0);
     const code = params.get("code");
     if (params.get("error") || !code) {
+      if (session.web) return plain("GitHub sign-in was cancelled.", 400);
       const res = redirectWithError(session.redirectUri, "access_denied", session.state);
       res.headers.append("Set-Cookie", clearCookie);
       return res;
@@ -545,6 +600,17 @@ export class OAuthServer {
     if (String(user.id) !== this.config.ownerGithubId) {
       console.warn(JSON.stringify({ auth: "refused", githubId: user.id }));
       return plain("This Shiori instance belongs to someone else.", 403);
+    }
+
+    if (session.web) {
+      const webToken = randomToken(32);
+      this.db
+        .prepare("INSERT INTO oauth_sessions (handle, kind, cookie_hash, payload, expires_at) VALUES (?, 'web', '', ?, ?)")
+        .run(sha256Hex(webToken), JSON.stringify({ userId: String(user.id), login: user.login }), Math.floor(Date.now() / 1000) + WEB_SESSION_TTL_SEC);
+      const headers = new Headers({ Location: "/ui", "Cache-Control": "no-store" });
+      headers.append("Set-Cookie", clearCookie);
+      headers.append("Set-Cookie", setWebCookieHeader(this.config.publicUrl, webToken, WEB_SESSION_TTL_SEC));
+      return new Response(null, { status: 302, headers });
     }
 
     const authCode = randomToken(32);

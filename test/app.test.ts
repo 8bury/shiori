@@ -258,6 +258,50 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     expect(cbRes.status).toBe(403);
   });
 
+  it("web viewer: GitHub owner sign-in, read-only API, and logout", async () => {
+    const base = "https://shiori.example.com";
+    // Signed out: login page, API refused
+    expect(await (await app.fetch(new Request(`${base}/ui`))).text()).toContain("/ui/login");
+    expect((await app.fetch(new Request(`${base}/ui/api/notes`))).status).toBe(401);
+
+    async function signIn() {
+      const login = await app.fetch(new Request(`${base}/ui/login`));
+      expect(login.status).toBe(302);
+      const ghState = new URL(login.headers.get("location")!).searchParams.get("state")!;
+      return app.fetch(
+        new Request(`${base}/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, { headers: { Cookie: extractCookie(login) } }),
+      );
+    }
+
+    // Wrong GitHub account is refused
+    githubUserId = 999;
+    expect((await signIn()).status).toBe(403);
+    githubUserId = 42;
+
+    const cb = await signIn();
+    expect(cb.status).toBe(302);
+    expect(cb.headers.get("location")).toBe("/ui");
+    const webCookie = cb.headers.getSetCookie().find((c) => c.startsWith("__Host-shiori_web="))!.split(";")[0];
+    const get = (p: string) => app.fetch(new Request(`${base}${p}`, { headers: { Cookie: webCookie } }));
+
+    expect(await (await get("/ui")).text()).toContain("Search memories and notes");
+    const { access_token } = await obtainToken();
+    await mcpRequest(access_token, "tools/call", { name: "memory_note", arguments: { content: "Pedro likes espresso" } });
+    await mcpRequest(access_token, "tools/call", { name: "write_note", arguments: { path: "projects/web.md", content: "# Web\n\nviewer" } });
+
+    const mem = (await (await get("/ui/api/memories")).json()) as { memories: { content: string }[] };
+    expect(mem.memories[0].content).toBe("Pedro likes espresso");
+    expect(((await (await get("/ui/api/notes")).json()) as { notes: string[] }).notes).toContain("projects/web.md");
+    expect(((await (await get("/ui/api/note?path=projects/web.md")).json()) as { content: string }).content).toContain("viewer");
+    expect((await get("/ui/api/note?path=../etc/passwd")).status).toBe(400);
+    const found = (await (await get("/ui/api/search?q=espresso")).json()) as { memories: string[] };
+    expect(found.memories.join("\n")).toContain("espresso");
+
+    const out = await app.fetch(new Request(`${base}/ui/logout`, { method: "POST", headers: { Cookie: webCookie } }));
+    expect(out.status).toBe(303);
+    expect((await get("/ui/api/notes")).status).toBe(401);
+  });
+
   it("supports full note lifecycle, hybrid search, refresh token, and grant revocation", async () => {
     const { access_token, refresh_token, clientId } = await obtainToken();
 

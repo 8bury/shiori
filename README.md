@@ -70,6 +70,10 @@ npm test
   - If a new client gets a `403` during sign-in, check the container logs for `{"auth":"redirect refused","redirectUri":"..."}` and add its callback prefix to `ALLOWED_REDIRECT_PREFIXES`.
 - **Agent instructions:** Shiori sends usage instructions automatically via MCP server `instructions`. For best results, also paste [MEMORY_PROMPT.md](MEMORY_PROMPT.md) into your `AGENTS.md` / `CLAUDE.md` or custom instructions in Muse and Grok.
 
+## Web viewer
+
+Open `https://shiori.yourdomain.com/ui` and sign in with GitHub (same OAuth App, same `OWNER_GITHUB_ID` check) to browse your memory timeline, notes, and summaries, and search across both. The viewer is read-only; sessions last 7 days.
+
 ## MCP Tools
 
 ### Episodic Memory Tree
