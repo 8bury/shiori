@@ -115,5 +115,23 @@ function migrate(db: DatabaseSync) {
       created_at TEXT NOT NULL,
       PRIMARY KEY (lo, hi)
     );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+      seq UNINDEXED,
+      content,
+      tokenize = 'unicode61 remove_diacritics 2',
+      prefix = '3'
+    );
   `);
+
+  // Backfill memory_fts for existing databases upgraded from earlier versions
+  const logCount = Number((db.prepare("SELECT COUNT(*) as c FROM memory_log").get() as { c: number }).c);
+  const ftsCount = Number((db.prepare("SELECT COUNT(*) as c FROM memory_fts").get() as { c: number }).c);
+  if (logCount > ftsCount) {
+    db.exec(`
+      INSERT INTO memory_fts (seq, content)
+      SELECT l.seq, l.content FROM memory_log l
+      WHERE NOT EXISTS (SELECT 1 FROM memory_fts f WHERE CAST(f.seq AS INTEGER) = l.seq);
+    `);
+  }
 }

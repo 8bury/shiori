@@ -6,7 +6,9 @@ import { OAuthServer } from "./auth/oauth.js";
 import type { AppConfig } from "./config.js";
 import type { Embedder } from "./indexer/types.js";
 import { checkPath, pathHash } from "./lib/notes.js";
-import { MEMORY_INSTRUCTIONS } from "./memory/prompt.js";
+import { MemoryCompactor } from "./memory/compactor.js";
+import { buildMemoryInstructions } from "./memory/prompt.js";
+import { createSummarizer, type MemorySummarizer } from "./memory/summarizer.js";
 import { MemoryStore } from "./memory/tree.js";
 import { IndexQueue } from "./queue.js";
 import { runReconcile } from "./reconcile/reconcile.js";
@@ -34,6 +36,7 @@ function hasBearer(request: Request, secret: string): boolean {
 
 export interface CreateAppOptions {
   embedder?: Embedder & { disabled?: boolean };
+  summarizer?: MemorySummarizer;
   fetcher?: typeof fetch;
   queueDelayMultiplier?: number;
 }
@@ -49,8 +52,12 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
   const keywords = new SqliteKeywords(db);
   const vectors = new SqliteVectorIndex(db);
   const alerts = new SqliteAlerts(db);
-  const memory = new MemoryStore(db, config.memoryWakeLines, path.join(config.dataDir, "memory.log"));
   const embedder = options.embedder ?? createEmbedder(config);
+  const summarizer = options.summarizer ?? createSummarizer(config, options.fetcher);
+  const autoCompact = !summarizer.disabled;
+  const memory = new MemoryStore(db, config.memoryWakeLines, path.join(config.dataDir, "memory.log"), autoCompact);
+  const compactor = new MemoryCompactor(memory, summarizer, alerts, options.queueDelayMultiplier ?? 1000);
+  if (autoCompact) compactor.trigger();
 
   const queue: IndexQueue = new IndexQueue(
     () => ({
@@ -99,10 +106,41 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     return describe(await runOp(op), op, done);
   }
 
+  const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+  const APPEND_ONLY = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
+  const MUTATING = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
+  const IDEMPOTENT_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+  const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } as const;
+
+  async function searchNotes(query: string, limit: number): Promise<string> {
+    const fts = buildFtsQuery(query);
+    const [keyword, semantic] = await Promise.all([
+      Promise.resolve()
+        .then<Hit[]>(() => (fts ? keywords.search(fts, 50) : []))
+        .catch((e) => (console.error(JSON.stringify({ keywordSearchFailed: String(e) })), null)),
+      (async () => {
+        if (embedder.disabled) return [] as Hit[];
+        const [q] = await embedder.embed([query]);
+        const matches = vectors.query(q, 50);
+        return semanticHits(matches, SEMANTIC_FLOOR);
+      })().catch((e) => (console.error(JSON.stringify({ semanticSearchFailed: String(e) })), null)),
+    ]);
+    if (keyword === null && semantic === null) return "Note search is unavailable right now. Try again in a moment.";
+    const results = fuse(keyword ?? [], semantic ?? [], limit);
+    const lines = results.map((r) => `${r.path} (${r.matched})\n${r.text.slice(0, 400)}`);
+    const note =
+      semantic === null
+        ? "\n\n(semantic search unavailable right now: keyword results only)"
+        : keyword === null
+          ? "\n\n(keyword search unavailable right now: semantic results only)"
+          : "";
+    return (lines.join("\n\n---\n\n") || "No notes found.") + note;
+  }
+
   function createServer() {
     const server = new McpServer(
-      { name: config.serverName, version: "0.4.0" },
-      { instructions: MEMORY_INSTRUCTIONS },
+      { name: config.serverName, version: "0.5.0" },
+      { instructions: buildMemoryInstructions(autoCompact) },
     );
 
     // ---------- Episodic Memory Tree ----------
@@ -113,6 +151,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
         description:
           "Reads your shared episodic memory timeline (recent memories verbatim, older ones exponentially summarized). Call this first at the start of every session.",
         inputSchema: { lines: z.number().int().min(8).max(500).optional() },
+        annotations: READ_ONLY,
       },
       async ({ lines }) => text(memory.wake(lines)),
     );
@@ -120,48 +159,79 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     server.registerTool(
       "memory_note",
       {
-        description:
-          "Records one short episodic memory (1 line, max 280 bytes): a fact, preference, decision, or event worth remembering across sessions and agents. If a compression is due, follow up with memory_nap.",
+        description: autoCompact
+          ? "Records one short episodic memory (1 line, max 280 bytes): a fact, preference, decision, or event worth remembering across sessions and agents."
+          : "Records one short episodic memory (1 line, max 280 bytes): a fact, preference, decision, or event worth remembering across sessions and agents. If a compression is due, follow up with memory_nap.",
         inputSchema: { content: z.string() },
+        annotations: APPEND_ONLY,
       },
-      async ({ content }, extra) => text(memory.note(content, extra.http?.authInfo?.clientId ?? "")),
+      async ({ content }, extra) => {
+        const res = memory.note(content, extra.http?.authInfo?.clientId ?? "");
+        if (autoCompact) compactor.trigger();
+        return text(res);
+      },
     );
 
-    server.registerTool(
-      "memory_nap",
-      {
-        description:
-          "Saves a 1-line summary (max 280 bytes) for a pending binary-tree range (e.g. range='0-1'). Call with no arguments to check if any compression is due.",
-        inputSchema: { range: z.string().optional(), summary: z.string().optional() },
-      },
-      async ({ range, summary }) => text(memory.nap(range, summary)),
-    );
-
-    server.registerTool(
-      "memory_recall",
-      {
-        description: "Searches every raw episodic memory ever recorded, word for word (case-insensitive substring by default; set regex=true for safe regex).",
-        inputSchema: { pattern: z.string(), limit: z.number().int().min(1).max(200).optional(), regex: z.boolean().optional() },
-      },
-      async ({ pattern, limit, regex }) => text(memory.recall(pattern, limit ?? 50, regex ?? false)),
-    );
+    if (!autoCompact) {
+      server.registerTool(
+        "memory_nap",
+        {
+          description:
+            "Saves a 1-line summary (max 280 bytes) for a pending binary-tree range (e.g. range='0-1'). Call with no arguments to check if any compression is due.",
+          inputSchema: { range: z.string().optional(), summary: z.string().optional() },
+          annotations: IDEMPOTENT_WRITE,
+        },
+        async ({ range, summary }) => text(memory.nap(range, summary)),
+      );
+    }
 
     server.registerTool(
       "memory_zoom",
       {
         description: "Opens a summarized memory tree node (e.g. '0-3') into its two halves, down to the raw memories.",
         inputSchema: { range: z.string() },
+        annotations: READ_ONLY,
       },
       async ({ range }) => text(memory.zoom(range)),
     );
 
+    // ---------- Unified Search ----------
+
     server.registerTool(
-      "memory_forget",
+      "search",
       {
-        description: "Drops a bad memory summary node (and its ancestors) so the next memory_nap rebuilds it from the raw log.",
-        inputSchema: { range: z.string() },
+        description:
+          "Searches across both episodic memories (FTS5 keyword + substring fallback) and long-form notes (hybrid keyword + semantic), returning separate sections without mixing rankings. Pass scope='memory' or scope='notes' to search only one layer; regex=true applies to raw memories.",
+        inputSchema: {
+          query: z.string(),
+          scope: z.enum(["all", "notes", "memory"]).optional(),
+          limit: z.number().int().min(1).max(50).optional(),
+          regex: z.boolean().optional(),
+        },
+        annotations: READ_ONLY,
       },
-      async ({ range }) => text(memory.forget(range)),
+      async ({ query, scope, limit, regex }) => {
+        const target = scope ?? "all";
+        const useRegex = regex ?? false;
+        if (target === "memory") {
+          const res = memory.search(query, limit ?? 20, useRegex);
+          if (res.error) return text(res.error);
+          return text(res.lines.length ? res.lines.join("\n") : `No memories matching "${query.trim()}".`);
+        }
+        if (target === "notes") {
+          return text(await searchNotes(query, Math.min(limit ?? 10, 20)));
+        }
+        const [memRes, notesText] = await Promise.all([
+          Promise.resolve(memory.search(query, limit ?? 15, useRegex)),
+          searchNotes(query, Math.min(limit ?? 10, 20)),
+        ]);
+        const memText = memRes.error
+          ? memRes.error
+          : memRes.lines.length
+            ? memRes.lines.join("\n")
+            : "No memories found.";
+        return text(`## Memories\n\n${memText}\n\n## Notes\n\n${notesText}`);
+      },
     );
 
     // ---------- Long-form Notes ----------
@@ -171,6 +241,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       {
         description: `Lists the notes in Shiori (Markdown file paths, e.g. ${config.ideasDir}/..., projects/..., decisions/...).`,
         inputSchema: { prefix: z.string().optional() },
+        annotations: READ_ONLY,
       },
       async ({ prefix }) => text((await notesSource.listNotes(prefix ?? "")).join("\n") || "No notes."),
     );
@@ -180,6 +251,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       {
         description: "Reads a whole note by path (e.g. overview.md, projects/roadmap.md). Also returns its version, which write_note needs to overwrite it.",
         inputSchema: { path: z.string() },
+        annotations: READ_ONLY,
       },
       async ({ path: rawPath }) => {
         const p = checkPath(rawPath);
@@ -195,44 +267,12 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     );
 
     server.registerTool(
-      "search_notes",
-      {
-        description:
-          "Hybrid search across notes: exact words (names, acronyms, terms) and meaning, in one ranked list. Each result says how it matched: keyword, semantic or both. Ignores accents and case; words match by prefix.",
-        inputSchema: { query: z.string(), limit: z.number().int().min(1).max(20).optional() },
-      },
-      async ({ query, limit }) => {
-        const fts = buildFtsQuery(query);
-        const [keyword, semantic] = await Promise.all([
-          Promise.resolve()
-            .then<Hit[]>(() => (fts ? keywords.search(fts, 50) : []))
-            .catch((e) => (console.error(JSON.stringify({ keywordSearchFailed: String(e) })), null)),
-          (async () => {
-            if (embedder.disabled) return [] as Hit[];
-            const [q] = await embedder.embed([query]);
-            const matches = vectors.query(q, 50);
-            return semanticHits(matches, SEMANTIC_FLOOR);
-          })().catch((e) => (console.error(JSON.stringify({ semanticSearchFailed: String(e) })), null)),
-        ]);
-        if (keyword === null && semantic === null) return text("Search is unavailable right now. Try again in a moment.");
-        const results = fuse(keyword ?? [], semantic ?? [], limit ?? 10);
-        const lines = results.map((r) => `${r.path} (${r.matched})\n${r.text.slice(0, 400)}`);
-        const note =
-          semantic === null
-            ? "\n\n(semantic search unavailable right now: keyword results only)"
-            : keyword === null
-              ? "\n\n(keyword search unavailable right now: semantic results only)"
-              : "";
-        return text((lines.join("\n\n---\n\n") || "Nothing found.") + note);
-      },
-    );
-
-    server.registerTool(
       "write_note",
       {
         description:
           "Creates a note, or overwrites a whole one (e.g. projects/roadmap.md). To overwrite, pass expected_version: the version read_note returned. If the note changed since, nothing is saved and you get a conflict: read it again and redo the change. To change only part of a note, prefer edit_note.",
         inputSchema: { path: z.string(), content: z.string(), expected_version: z.string().optional() },
+        annotations: DESTRUCTIVE,
       },
       async ({ path: rawPath, content, expected_version }) => {
         const p = checkPath(rawPath);
@@ -246,6 +286,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
         description:
           "Replaces an exact passage of a note with another (old_text must appear exactly once). An empty new_text deletes the passage. Use read_note first to copy the exact passage.",
         inputSchema: { path: z.string(), old_text: z.string(), new_text: z.string() },
+        annotations: MUTATING,
       },
       async ({ path: rawPath, old_text, new_text }) => {
         const p = checkPath(rawPath);
@@ -258,6 +299,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       {
         description: "Deletes a note (it stays recoverable in the Git history).",
         inputSchema: { path: z.string() },
+        annotations: DESTRUCTIVE,
       },
       async ({ path: rawPath }) => {
         const p = checkPath(rawPath);
@@ -270,6 +312,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       {
         description: `Moves or renames a note in one commit (e.g. ${config.ideasDir}/x.md to projects/x.md).`,
         inputSchema: { from: z.string(), to: z.string() },
+        annotations: MUTATING,
       },
       async ({ from, to }) => {
         const a = checkPath(from);
@@ -303,7 +346,12 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     const { pathname } = url;
 
     if (pathname === "/health" && request.method === "GET") {
-      return Response.json({ ok: true, embeddingProvider: config.embeddingProvider });
+      return Response.json({
+        ok: true,
+        embeddingProvider: config.embeddingProvider,
+        memorySummaryProvider: config.memorySummaryProvider,
+        autoCompact,
+      });
     }
 
     if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") {
@@ -365,12 +413,30 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       return Response.json(report, { status: 202 });
     }
 
+    if (pathname === "/admin/memory/forget" && request.method === "POST") {
+      if (!hasBearer(request, config.adminSecret)) return new Response("Not found", { status: 404 });
+      let range = url.searchParams.get("range") ?? "";
+      if (!range) {
+        try {
+          const body = (await request.json()) as { range?: unknown };
+          if (typeof body?.range === "string") range = body.range;
+        } catch {
+          // ignore invalid/empty JSON body
+        }
+      }
+      if (!range.trim()) return Response.json({ error: "Missing range" }, { status: 400 });
+      const message = memory.forget(range);
+      if (autoCompact) compactor.trigger();
+      return Response.json({ message });
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
   async function close() {
+    compactor.close();
     queue.close();
-    await queue.drain();
+    await Promise.all([compactor.drain(), queue.drain()]);
     await mcp.close();
     db.close();
   }
@@ -380,6 +446,7 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     reconcile,
     purgeExpired: () => oauth.purgeExpired(),
     queue,
+    compactor,
     oauth,
     db,
     close,

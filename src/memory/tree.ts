@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { buildFtsQuery } from "../search/hybrid.js";
 
 export const MAX_MEMORY_BYTES = 280;
 const MAX_REGEX_LENGTH = 100;
@@ -116,6 +117,7 @@ export class MemoryStore {
     private readonly db: DatabaseSync,
     private readonly wakeLines = 96,
     private readonly logFilePath?: string,
+    private readonly autoCompact = false,
   ) {}
 
   count(): number {
@@ -199,10 +201,11 @@ export class MemoryStore {
       cover = cover.slice(omitted);
     }
     const lines = cover.map((n) => this.nodeText(n.lo, n.hi)).filter((x): x is string => x !== null);
-    const pending = this.nextPendingMerge();
+    const pending = this.autoCompact ? null : this.nextPendingMerge();
     const out = [`Memory (${total} total entries, showing ${lines.length} lines):`];
     if (omitted > 0) {
-      out.push(`(${omitted} older unsummarized entries omitted; run memory_nap to compress)`);
+      const hint = this.autoCompact ? "background compression in progress" : "run memory_nap to compress";
+      out.push(`(${omitted} older unsummarized entries omitted; ${hint})`);
     }
     out.push(...lines);
     if (pending) {
@@ -225,6 +228,7 @@ export class MemoryStore {
       const row = this.db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 as nextSeq FROM memory_log").get() as { nextSeq: number };
       seq = Number(row.nextSeq);
       this.db.prepare("INSERT INTO memory_log (seq, content, source, created_at) VALUES (?, ?, ?, ?)").run(seq, content, source, now);
+      this.db.prepare("INSERT INTO memory_fts (seq, content) VALUES (?, ?)").run(seq, content);
       this.db.exec("COMMIT");
     } catch (e) {
       this.db.exec("ROLLBACK");
@@ -241,9 +245,22 @@ export class MemoryStore {
       }
     }
 
-    const pending = this.nextPendingMerge();
+    const pending = this.autoCompact ? null : this.nextPendingMerge();
     const saved = `Recorded #${seq}: ${content}`;
     return pending ? `${saved}\n\n${this.formatMergePrompt(pending)}` : saved;
+  }
+
+  saveSummary(lo: number, hi: number, rawSummary: string): { saved: boolean; summary: string } {
+    if (!isValidTreeRange(lo, hi)) throw new Error(`Invalid range #${lo}-${hi}`);
+    const summary = cleanOneLine(rawSummary);
+    if (!summary) throw new Error("Summary cannot be empty");
+    if (byteLength(summary) > MAX_MEMORY_BYTES) {
+      throw new Error(`Summary exceeds ${MAX_MEMORY_BYTES} bytes`);
+    }
+    const res = this.db
+      .prepare("INSERT OR IGNORE INTO memory_tree (lo, hi, summary, created_at) VALUES (?, ?, ?, ?)")
+      .run(lo, hi, summary, new Date().toISOString());
+    return { saved: Number(res.changes) > 0, summary };
   }
 
   nap(rangeStr?: string, rawSummary?: string): string {
@@ -301,6 +318,72 @@ export class MemoryStore {
     return [`Zoom #${range.lo}-${range.hi}:`, `  ${left}`, `  ${right}`].join("\n");
   }
 
+  search(query: string, limit = 20, useRegex = false): { lines: string[]; error?: string } {
+    const q = query.trim();
+    if (!q) return { lines: [], error: "Provide a search query." };
+
+    if (useRegex) {
+      if (!isSafeRegex(q)) {
+        return {
+          lines: [],
+          error: `Unsafe or too-long regex pattern (max ${MAX_REGEX_LENGTH} chars, no nested quantifiers). Use plain text search or simplify the pattern.`,
+        };
+      }
+      let re: RegExp;
+      try {
+        re = new RegExp(q, "i");
+      } catch {
+        return { lines: [], error: `Invalid regex pattern: "${q}".` };
+      }
+      const rows = this.db.prepare("SELECT seq, content, created_at FROM memory_log ORDER BY seq DESC").all() as unknown as {
+        seq: number;
+        content: string;
+        created_at: string;
+      }[];
+      const matches: string[] = [];
+      for (const r of rows) {
+        if (re.test(r.content)) {
+          matches.push(`#${r.seq} [${r.created_at.slice(0, 10)}] ${r.content}`);
+          if (matches.length >= limit) break;
+        }
+      }
+      return { lines: matches.reverse() };
+    }
+
+    const fts = buildFtsQuery(q);
+    if (fts) {
+      const ftsRows = this.db
+        .prepare(
+          `SELECT l.seq, l.content, l.created_at
+           FROM memory_fts f
+           JOIN memory_log l ON l.seq = CAST(f.seq AS INTEGER)
+           WHERE memory_fts MATCH ?
+           ORDER BY bm25(memory_fts), l.seq DESC
+           LIMIT ?`,
+        )
+        .all(fts, limit) as unknown as { seq: number; content: string; created_at: string }[];
+      if (ftsRows.length > 0) {
+        return { lines: ftsRows.map((r) => `#${r.seq} [${r.created_at.slice(0, 10)}] ${r.content}`) };
+      }
+    }
+
+    // Fallback to case-insensitive substring match (handles short terms < 3 chars, punctuation, etc.)
+    const lower = q.toLowerCase();
+    const rows = this.db.prepare("SELECT seq, content, created_at FROM memory_log ORDER BY seq DESC").all() as unknown as {
+      seq: number;
+      content: string;
+      created_at: string;
+    }[];
+    const matches: string[] = [];
+    for (const r of rows) {
+      if (r.content.toLowerCase().includes(lower)) {
+        matches.push(`#${r.seq} [${r.created_at.slice(0, 10)}] ${r.content}`);
+        if (matches.length >= limit) break;
+      }
+    }
+    return { lines: matches.reverse() };
+  }
+
   recall(pattern: string, limit = 50, useRegex = false): string {
     const q = pattern.trim();
     if (!q) return "Provide a search pattern.";
@@ -341,7 +424,7 @@ export class MemoryStore {
     const res = this.db.prepare("DELETE FROM memory_tree WHERE lo <= ? AND hi >= ?").run(range.lo, range.hi);
     const removed = Number(res.changes);
     if (removed === 0) return `No summary found for #${range.lo}-${range.hi}.`;
-    const next = this.nextPendingMerge();
+    const next = this.autoCompact ? null : this.nextPendingMerge();
     const msg = `Dropped ${removed} summary node(s) covering #${range.lo}-${range.hi}.`;
     return next ? `${msg}\n\n${this.formatMergePrompt(next)}` : msg;
   }

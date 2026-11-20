@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { computeWakeCover, MAX_MEMORY_BYTES, MemoryStore, parseRange } from "../src/memory/tree";
+import { loadConfig } from "../src/config";
+import { buildMemoryInstructions } from "../src/memory/prompt";
+import { fitSummary } from "../src/memory/summarizer";
+import { byteLength, computeWakeCover, MAX_MEMORY_BYTES, MemoryStore, parseRange } from "../src/memory/tree";
 import { openDatabase } from "../src/storage/db";
 
 describe("parseRange", () => {
@@ -169,5 +172,48 @@ describe("MemoryStore", () => {
     expect(body).toContain("6 older unsummarized entries omitted");
     expect(body).toContain("#9 [");
     expect(body).not.toContain("#0 [");
+  });
+
+  it("supports FTS5 natural-language search and substring fallback on memories", () => {
+    store.note("Usuário prefere deploy no Coolify com Docker no servidor fender", "claude");
+    store.note("Usa Go para ferramentas de CLI rápidas", "muse");
+
+    // Natural language query (diacritics + multiple non-adjacent words)
+    const fts = store.search("preferencias de deploy no fender");
+    expect(fts.error).toBeUndefined();
+    expect(fts.lines).toHaveLength(1);
+    expect(fts.lines[0]).toContain("#0 [");
+
+    // Short 2-char token falls back to substring search
+    const short = store.search("Go");
+    expect(short.lines).toHaveLength(1);
+    expect(short.lines[0]).toContain("#1 [");
+  });
+});
+
+describe("Summarizer & config", () => {
+  it("fitSummary cleans quotes/newlines and truncates safely within 280 UTF-8 bytes", () => {
+    expect(fitSummary('"Hello\nworld"')).toBe("Hello world");
+    const longEmoji = "Resumo longo com acentuação e emojis 🚀 ".repeat(15);
+    const fitted = fitSummary(longEmoji);
+    expect(byteLength(fitted)).toBeLessThanOrEqual(MAX_MEMORY_BYTES);
+    expect(fitted.endsWith("...")).toBe(true);
+  });
+
+  it("auto-detects Gemini summary config from EMBEDDING_PROVIDER + EMBEDDING_API_KEY", () => {
+    const cfg = loadConfig({
+      EMBEDDING_PROVIDER: "gemini",
+      EMBEDDING_API_KEY: "gem-test-key",
+    });
+    expect(cfg.memorySummaryProvider).toBe("gemini");
+    expect(cfg.memorySummaryApiKey).toBe("gem-test-key");
+    expect(cfg.memorySummaryModel).toBe("gemini-2.5-flash");
+  });
+
+  it("keeps MEMORY_PROMPT.md in sync with buildMemoryInstructions(true)", () => {
+    const md = fs.readFileSync(path.resolve("MEMORY_PROMPT.md"), "utf8");
+    const match = md.match(/```markdown\n([\s\S]*?)\n```/);
+    expect(match).toBeTruthy();
+    expect(match![1]).toBe(buildMemoryInstructions(true));
   });
 });

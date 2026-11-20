@@ -87,11 +87,12 @@ async function main() {
     }
   });
 
-  // Daily maintenance: reconcile index + purge expired OAuth grants/tokens/clients
+  // Daily maintenance: reconcile index + purge expired OAuth grants/tokens/clients + compact any pending memory merges
   const dailyTimer = setInterval(async () => {
     try {
       const purged = app.purgeExpired();
       const report = await app.reconcile("daily");
+      app.compactor.trigger();
       console.log(JSON.stringify({ dailyMaintenance: { purged, report } }));
     } catch (e) {
       console.error(JSON.stringify({ dailyMaintenanceFailed: String(e) }));
@@ -133,6 +134,7 @@ async function main() {
         publicUrl: config.publicUrl,
         dataDir: config.dataDir,
         embeddingProvider: config.embeddingProvider,
+        memorySummaryProvider: config.memorySummaryProvider,
       }),
     );
   });

@@ -76,18 +76,20 @@ npm test
 | Tool | Description |
 |---|---|
 | `memory_wake` | Read the logarithmic timeline (recent verbatim, older summarized) at session start |
-| `memory_note` | Record a 1-line memory (<= 280 bytes); prompts for compression when a pair completes |
-| `memory_nap` | Save a 1-line summary for a pending `#lo-hi` range (or check what is due) |
-| `memory_recall` | Search every raw memory ever recorded (substring by default, or opt-in safe regex) |
+| `memory_note` | Record a 1-line memory (<= 280 bytes); tree compaction runs automatically in the background when a summary LLM is configured |
 | `memory_zoom` | Open a `#lo-hi` summary node into its two halves down to raw memories |
-| `memory_forget` | Drop a bad `#lo-hi` summary (and ancestors) so the next `memory_nap` rebuilds it |
+| `memory_nap` | *(Fallback only, registered when `MEMORY_SUMMARY_PROVIDER=none`)* Save a 1-line summary for a pending `#lo-hi` range |
+
+### Unified Search
+| Tool | Description |
+|---|---|
+| `search` | Search both episodic memories (FTS5 + substring fallback; opt-in safe regex) and long-form notes (hybrid FTS5 + vector search) in separate sections, or filter with `scope` |
 
 ### Long-form Notes
 | Tool | Description |
 |---|---|
 | `list_notes` | List Markdown note paths (optional prefix filter) |
 | `read_note` | Read a note and its version hash |
-| `search_notes` | Hybrid keyword (FTS5) + semantic (vector) search fused with Reciprocal Rank Fusion |
 | `write_note` | Create or overwrite a note (with optimistic version check) |
 | `edit_note` | Replace an exact passage in a note |
 | `delete_note` | Delete a note (recoverable in Git history) |
@@ -100,6 +102,7 @@ Protected by `Authorization: Bearer <ADMIN_SECRET>`:
 - `GET /admin/grants`: list active OAuth client grants
 - `DELETE /admin/grants/<id>`: revoke one client grant
 - `POST /admin/reconcile`: reconcile the search index with Git (`?mode=rebuild` for a full rebuild)
+- `POST /admin/memory/forget`: drop a bad `#lo-hi` summary (and ancestors) so it rebuilds from the raw log (`{"range":"0-1"}`)
 
 ## Credits & License
 

@@ -1,6 +1,7 @@
 import path from "node:path";
 
 export type EmbeddingProvider = "openai" | "gemini" | "none";
+export type MemorySummaryProvider = "openai" | "gemini" | "none";
 
 export interface AppConfig {
   port: number;
@@ -23,6 +24,10 @@ export interface AppConfig {
   embeddingApiKey: string;
   embeddingModel: string;
   embeddingBaseUrl: string;
+  memorySummaryProvider: MemorySummaryProvider;
+  memorySummaryApiKey: string;
+  memorySummaryModel: string;
+  memorySummaryBaseUrl: string;
   gitRemoteUrl: string;
   gitAuthorName: string;
   gitAuthorEmail: string;
@@ -43,6 +48,19 @@ function detectEmbeddingProvider(env: NodeJS.ProcessEnv): EmbeddingProvider {
   return "none";
 }
 
+function detectMemorySummaryProvider(
+  env: NodeJS.ProcessEnv,
+  embeddingProvider: EmbeddingProvider,
+  embeddingApiKey: string,
+): MemorySummaryProvider {
+  const explicit = env.MEMORY_SUMMARY_PROVIDER?.trim().toLowerCase();
+  if (explicit === "openai" || explicit === "gemini" || explicit === "none") return explicit;
+  if (env.MEMORY_SUMMARY_BASE_URL?.trim()) return "openai";
+  if (env.GEMINI_API_KEY?.trim() || (embeddingProvider === "gemini" && embeddingApiKey)) return "gemini";
+  if (env.OPENAI_API_KEY?.trim() || (embeddingProvider === "openai" && embeddingApiKey)) return "openai";
+  return "none";
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const dataDir = path.resolve(env.DATA_DIR?.trim() || "./data");
   const embeddingProvider = detectEmbeddingProvider(env);
@@ -51,6 +69,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     (embeddingProvider === "openai" ? env.OPENAI_API_KEY?.trim() : embeddingProvider === "gemini" ? env.GEMINI_API_KEY?.trim() : "") ||
     "";
   const defaultModel = embeddingProvider === "gemini" ? "gemini-embedding-001" : "text-embedding-3-small";
+
+  const memorySummaryProvider = detectMemorySummaryProvider(env, embeddingProvider, embeddingApiKey);
+  const memorySummaryApiKey =
+    env.MEMORY_SUMMARY_API_KEY?.trim() ||
+    (memorySummaryProvider === "gemini"
+      ? env.GEMINI_API_KEY?.trim() || (embeddingProvider === "gemini" ? embeddingApiKey : "")
+      : memorySummaryProvider === "openai"
+        ? env.OPENAI_API_KEY?.trim() || (embeddingProvider === "openai" ? embeddingApiKey : "")
+        : "") ||
+    "";
+  const defaultSummaryModel = memorySummaryProvider === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini";
 
   const extraRedirects = (env.ALLOWED_REDIRECT_PREFIXES ?? "")
     .split(",")
@@ -78,6 +107,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     embeddingApiKey,
     embeddingModel: env.EMBEDDING_MODEL?.trim() || defaultModel,
     embeddingBaseUrl: (env.EMBEDDING_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""),
+    memorySummaryProvider,
+    memorySummaryApiKey,
+    memorySummaryModel: env.MEMORY_SUMMARY_MODEL?.trim() || defaultSummaryModel,
+    memorySummaryBaseUrl: (env.MEMORY_SUMMARY_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""),
     gitRemoteUrl: env.GIT_REMOTE_URL?.trim() || "",
     gitAuthorName: env.GIT_AUTHOR_NAME?.trim() || "Shiori",
     gitAuthorEmail: env.GIT_AUTHOR_EMAIL?.trim() || "shiori@localhost",
