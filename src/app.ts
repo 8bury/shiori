@@ -10,7 +10,8 @@ import { MemoryCompactor } from "./memory/compactor.js";
 import { buildMemoryInstructions } from "./memory/prompt.js";
 import { createSummarizer, type MemorySummarizer } from "./memory/summarizer.js";
 import { MemoryStore } from "./memory/tree.js";
-import { Observability, observeEmbedder, observeSummarizer } from "./observability.js";
+import { isRateLimitError, Observability, observeEmbedder, observeSummarizer } from "./observability.js";
+import { Metrics } from "./metrics.js";
 import { IndexQueue } from "./queue.js";
 import { runReconcile } from "./reconcile/reconcile.js";
 import type { Mode, Report } from "./reconcile/types.js";
@@ -54,7 +55,8 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
   const keywords = new SqliteKeywords(db);
   const vectors = new SqliteVectorIndex(db);
   const alerts = new SqliteAlerts(db);
-  const observability = new Observability(alerts, config.alertWebhookUrl, config.serverName, options.fetcher);
+  const metrics = new Metrics(db);
+  const observability = new Observability(alerts, config.alertWebhookUrl, config.serverName, options.fetcher, metrics);
   const embedder = observeEmbedder(options.embedder ?? createEmbedder(config), observability);
   const summarizer = observeSummarizer(options.summarizer ?? createSummarizer(config, options.fetcher), observability);
   const autoCompact = !summarizer.disabled;
@@ -148,11 +150,49 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     return (lines.join("\n\n---\n\n") || "No notes found.") + note;
   }
 
+  function clientLabel(clientId: string): string {
+    if (!clientId) return "unknown";
+    const row = db.prepare("SELECT client_name FROM oauth_clients WHERE client_id = ?").get(clientId) as { client_name: string } | undefined;
+    if (row) return row.client_name;
+    try {
+      return new URL(clientId).hostname;
+    } catch {
+      return clientId.slice(0, 40);
+    }
+  }
+
+  // Wraps every tool handler so each call is timed and counted (per tool and per client) in Metrics.
+  function instrumentTools(server: McpServer) {
+    type Handler = (...args: unknown[]) => Promise<{ isError?: boolean; content?: { text?: string }[] }>;
+    const register = server.registerTool.bind(server) as unknown as (name: string, cfg: unknown, cb: Handler) => unknown;
+    (server as unknown as { registerTool: typeof register }).registerTool = (name, cfg, cb) =>
+      register(name, cfg, async (...args) => {
+        const extra = args[args.length - 1] as { http?: { authInfo?: { clientId?: string } } } | undefined;
+        const client = clientLabel(extra?.http?.authInfo?.clientId ?? "");
+        const t0 = performance.now();
+        try {
+          const res = await cb(...args);
+          const ok = !res?.isError;
+          const error = ok ? undefined : (res.content?.[0]?.text ?? "tool returned an error");
+          const ev = { ok, ms: performance.now() - t0, error, rateLimited: !ok && isRateLimitError(error) };
+          metrics.record({ kind: "tool", name, ...ev });
+          metrics.record({ kind: "client", name: client, ...ev, error: ok ? undefined : `${name}: ${error}` });
+          return res;
+        } catch (e) {
+          const ev = { ok: false, ms: performance.now() - t0, rateLimited: isRateLimitError(e) };
+          metrics.record({ kind: "tool", name, ...ev, error: String(e) });
+          metrics.record({ kind: "client", name: client, ...ev, error: `${name}: ${String(e)}` });
+          throw e;
+        }
+      });
+  }
+
   function createServer() {
     const server = new McpServer(
       { name: config.serverName, version: "0.5.0" },
       { instructions: buildMemoryInstructions(autoCompact) },
     );
+    instrumentTools(server);
 
     // ---------- Episodic Memory Tree ----------
 
@@ -394,12 +434,36 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     }
 
     if (pathname === "/ui" || pathname.startsWith("/ui/")) {
-      return handleWeb(request, { oauth, db, memory, notesSource, searchNotes: searchNotesRaw });
+      return handleWeb(request, {
+        oauth,
+        db,
+        memory,
+        notesSource,
+        searchNotes: searchNotesRaw,
+        health: (hours) => ({
+          ...metrics.summary(hours),
+          services: {
+            embedding: { provider: config.embeddingProvider, model: config.embeddingModel, disabled: Boolean(embedder.disabled), ...observability.getStats("embedding") },
+            memorySummary: {
+              provider: config.memorySummaryProvider,
+              model: config.memorySummaryModel,
+              autoCompact,
+              pendingCompactions: memory.countPendingMerges(),
+              ...observability.getStats("memory-summary"),
+            },
+          },
+          queue: { deadLetters: alerts.listOpen(50).filter((a) => a.source === "dlq").length },
+          openAlerts: alerts.listOpen(50),
+        }),
+      });
     }
 
     if (pathname === "/mcp") {
       const verified = oauth.verifyBearer(request);
-      if (!verified) return oauth.unauthorizedResponse();
+      if (!verified) {
+        metrics.record({ kind: "http", name: "mcp_unauthorized", ok: true });
+        return oauth.unauthorizedResponse();
+      }
       console.log(JSON.stringify({ mcp: request.method, clientId: verified.clientId, userId: verified.userId }));
       return mcp.fetch(request, {
         authInfo: {

@@ -1,5 +1,6 @@
 import type { Embedder } from "./indexer/types.js";
 import type { MemorySummarizer } from "./memory/summarizer.js";
+import type { Metrics } from "./metrics.js";
 import type { SqliteAlerts } from "./storage/sqlite-adapters.js";
 
 export type ServiceKind = "embedding" | "memory-summary";
@@ -47,9 +48,11 @@ export class Observability {
     private readonly webhookUrl = "",
     private readonly serverName = "shiori",
     private readonly fetcher: typeof fetch = fetch,
+    private readonly metrics?: Metrics,
   ) {}
 
-  recordSuccess(kind: ServiceKind) {
+  recordSuccess(kind: ServiceKind, ms?: number) {
+    this.metrics?.record({ kind: "service", name: kind, ok: true, ms });
     const s = this.stats[kind];
     s.okCount += 1;
     const recovered = s.consecutiveFailures > 0;
@@ -62,11 +65,12 @@ export class Observability {
     }
   }
 
-  recordFailure(kind: ServiceKind, error: unknown) {
+  recordFailure(kind: ServiceKind, error: unknown, ms?: number) {
     const s = this.stats[kind];
     const now = new Date().toISOString();
     const message = String(error).slice(0, 300);
     const rateLimited = isRateLimitError(error);
+    this.metrics?.record({ kind: "service", name: kind, ok: false, ms, rateLimited, error: message });
 
     s.errorCount += 1;
     if (rateLimited) s.rateLimitCount += 1;
@@ -147,12 +151,13 @@ export function observeEmbedder(inner: Embedder & { disabled?: boolean }, obs: O
   return {
     async embed(texts: string[]): Promise<number[][]> {
       if (!texts.length) return [];
+      const t0 = performance.now();
       try {
         const res = await inner.embed(texts);
-        obs.recordSuccess("embedding");
+        obs.recordSuccess("embedding", performance.now() - t0);
         return res;
       } catch (e) {
-        obs.recordFailure("embedding", e);
+        obs.recordFailure("embedding", e, performance.now() - t0);
         throw e;
       }
     },
@@ -163,12 +168,13 @@ export function observeSummarizer(inner: MemorySummarizer, obs: Observability): 
   if (inner.disabled) return inner;
   return {
     async summarize(left: string, right: string): Promise<string> {
+      const t0 = performance.now();
       try {
         const res = await inner.summarize(left, right);
-        obs.recordSuccess("memory-summary");
+        obs.recordSuccess("memory-summary", performance.now() - t0);
         return res;
       } catch (e) {
-        obs.recordFailure("memory-summary", e);
+        obs.recordFailure("memory-summary", e, performance.now() - t0);
         throw e;
       }
     },

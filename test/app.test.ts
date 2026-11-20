@@ -297,6 +297,19 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     const found = (await (await get("/ui/api/search?q=espresso")).json()) as { memories: string[] };
     expect(found.memories.join("\n")).toContain("espresso");
 
+    await mcpRequest(access_token, "tools/call", { name: "read_note", arguments: { path: "../bad" } });
+    const health = (await (await get("/ui/api/health?hours=24")).json()) as {
+      totals: { kind: string; name: string; ok: number; err: number }[];
+      errors: { name: string }[];
+      services: { embedding: { provider: string } };
+    };
+    const tool = (name: string) => health.totals.find((r) => r.kind === "tool" && r.name === name);
+    expect(tool("memory_note")?.ok).toBe(1);
+    expect(tool("read_note")?.err).toBe(1);
+    expect(health.totals.some((r) => r.kind === "client" && r.ok >= 2)).toBe(true);
+    expect(health.errors.some((e) => e.name === "read_note")).toBe(true);
+    expect(health.services.embedding.provider).toBeTruthy();
+
     const out = await app.fetch(new Request(`${base}/ui/logout`, { method: "POST", headers: { Cookie: webCookie } }));
     expect(out.status).toBe(303);
     expect((await get("/ui/api/notes")).status).toBe(401);

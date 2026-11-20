@@ -11,6 +11,7 @@ export interface WebDeps {
   db: DatabaseSync;
   memory: MemoryStore;
   notesSource: Pick<LocalGitNotesSource, "listNotes" | "readNote">;
+  health: (hours: number) => unknown;
   searchNotes: (query: string, limit: number) => Promise<{ results: Fused[]; keywordFailed: boolean; semanticFailed: boolean } | null>;
 }
 
@@ -63,6 +64,11 @@ export async function handleWeb(request: Request, deps: WebDeps): Promise<Respon
     const summaries = Number((deps.db.prepare("SELECT COUNT(*) AS c FROM memory_tree").get() as { c: number }).c);
     const notes = (await deps.notesSource.listNotes("")).length;
     return json({ memories, summaries, notes });
+  }
+
+  if (endpoint === "health") {
+    const hours = Math.min(Math.max(Number(q.get("hours")) || 24, 1), 24 * 90);
+    return json(deps.health(hours));
   }
 
   if (endpoint === "memories") {
