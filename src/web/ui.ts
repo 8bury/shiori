@@ -73,7 +73,21 @@ export async function handleWeb(request: Request, deps: WebDeps): Promise<Respon
 
   if (endpoint === "memories") {
     const limit = Math.min(Math.max(Number(q.get("limit")) || 100, 1), 500);
-    const before = q.has("before") ? Number(q.get("before")) : Number.MAX_SAFE_INTEGER;
+    if (q.has("lo") || q.has("hi")) {
+      const loRaw = q.get("lo") ?? "";
+      const hiRaw = q.get("hi") ?? "";
+      const lo = loRaw.trim() === "" ? NaN : Number(loRaw);
+      const hi = hiRaw.trim() === "" ? NaN : Number(hiRaw);
+      if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < 0 || hi < lo) {
+        return json({ error: "invalid range" }, 400);
+      }
+      const rows = deps.db
+        .prepare("SELECT seq, content, source, created_at FROM memory_log WHERE seq >= ? AND seq <= ? ORDER BY seq ASC LIMIT ?")
+        .all(lo, hi, limit);
+      return json({ memories: rows });
+    }
+    const beforeRaw = q.has("before") ? Number(q.get("before")) : Number.MAX_SAFE_INTEGER;
+    const before = Number.isFinite(beforeRaw) ? beforeRaw : Number.MAX_SAFE_INTEGER;
     const rows = deps.db
       .prepare("SELECT seq, content, source, created_at FROM memory_log WHERE seq < ? ORDER BY seq DESC LIMIT ?")
       .all(before, limit);

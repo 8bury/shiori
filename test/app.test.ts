@@ -287,10 +287,17 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
     expect(await (await get("/ui")).text()).toContain("Search memories and notes");
     const { access_token } = await obtainToken();
     await mcpRequest(access_token, "tools/call", { name: "memory_note", arguments: { content: "Pedro likes espresso" } });
+    await mcpRequest(access_token, "tools/call", { name: "memory_note", arguments: { content: "Pedro uses dark mode" } });
     await mcpRequest(access_token, "tools/call", { name: "write_note", arguments: { path: "projects/web.md", content: "# Web\n\nviewer" } });
 
-    const mem = (await (await get("/ui/api/memories")).json()) as { memories: { content: string }[] };
-    expect(mem.memories[0].content).toBe("Pedro likes espresso");
+    const mem = (await (await get("/ui/api/memories")).json()) as { memories: { seq: number; content: string }[] };
+    expect(mem.memories[0].content).toBe("Pedro uses dark mode");
+    expect(mem.memories[1].content).toBe("Pedro likes espresso");
+    const rangeMem = (await (await get("/ui/api/memories?lo=0&hi=1")).json()) as { memories: { seq: number; content: string }[] };
+    expect(rangeMem.memories.map((m) => m.seq)).toEqual([0, 1]);
+    expect((await get("/ui/api/memories?lo=2&hi=1")).status).toBe(400);
+    expect((await get("/ui/api/memories?lo=0")).status).toBe(400);
+    expect((await get("/ui/api/memories?lo=-1&hi=1")).status).toBe(400);
     expect(((await (await get("/ui/api/notes")).json()) as { notes: string[] }).notes).toContain("projects/web.md");
     expect(((await (await get("/ui/api/note?path=projects/web.md")).json()) as { content: string }).content).toContain("viewer");
     expect((await get("/ui/api/note?path=../etc/passwd")).status).toBe(400);
@@ -304,7 +311,7 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
       services: { embedding: { provider: string } };
     };
     const tool = (name: string) => health.totals.find((r) => r.kind === "tool" && r.name === name);
-    expect(tool("memory_note")?.ok).toBe(1);
+    expect(tool("memory_note")?.ok).toBe(2);
     expect(tool("read_note")?.err).toBe(1);
     expect(health.totals.some((r) => r.kind === "client" && r.ok >= 2)).toBe(true);
     expect(health.errors.some((e) => e.name === "read_note")).toBe(true);
