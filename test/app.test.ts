@@ -495,4 +495,173 @@ describe("end-to-end Node app (OAuth 2.1 + MCP + SQLite + Git)", () => {
       fs.rmSync(fallbackDir, { recursive: true, force: true });
     }
   });
+
+  it("tracks embedding/summary 429 failures in /health, /admin/status, memory_wake, and webhook, and auto-resolves on recovery", async () => {
+    const obsDir = fs.mkdtempSync(path.join(os.tmpdir(), "shiori-obs-"));
+    const webhookPayloads: unknown[] = [];
+    let failSummary = true;
+    const flakySummarizer: MemorySummarizer = {
+      async summarize(left, right) {
+        if (failSummary) throw new Error("Gemini summary failed (429): RESOURCE_EXHAUSTED quota exceeded");
+        return `Combined: ${left.slice(0, 30)} + ${right.slice(0, 30)}`;
+      },
+    };
+    const obsFetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url === "https://hooks.example.com/alerts") {
+        webhookPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response("ok", { status: 200 });
+      }
+      return mockFetcher(input, init);
+    };
+
+    const obsApp = await createApp(
+      loadConfig({
+        DATA_DIR: obsDir,
+        PUBLIC_URL: "https://shiori.example.com",
+        GITHUB_CLIENT_ID: "gh-client",
+        GITHUB_CLIENT_SECRET: "gh-secret",
+        OWNER_GITHUB_ID: "42",
+        ADMIN_SECRET: "obs-secret",
+        ALERT_WEBHOOK_URL: "https://hooks.example.com/alerts",
+      }),
+      {
+        embedder: new ToyEmbedder(),
+        summarizer: flakySummarizer,
+        fetcher: obsFetcher,
+        queueDelayMultiplier: 1,
+      },
+    );
+
+    try {
+      // Obtain token on obsApp
+      const reg = await obsApp.fetch(
+        new Request("https://shiori.example.com/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_name: "Obs", redirect_uris: ["http://127.0.0.1:4321/cb"] }),
+        }),
+      );
+      const { client_id } = (await reg.json()) as { client_id: string };
+      const verifier = "obs-pkce-verifier-string-1234567890";
+      const cRes = await obsApp.fetch(
+        new Request(
+          `https://shiori.example.com/authorize?client_id=${client_id}&redirect_uri=http://127.0.0.1:4321/cb&response_type=code&code_challenge=${s256(verifier)}&code_challenge_method=S256`,
+        ),
+      );
+      const handle = (await cRes.text()).match(/name="handle" value="([^"]+)"/)![1];
+      const aRes = await obsApp.fetch(
+        new Request("https://shiori.example.com/authorize", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: extractCookie(cRes) },
+          body: new URLSearchParams({ handle, decision: "approve" }),
+        }),
+      );
+      const ghState = new URL(aRes.headers.get("location")!).searchParams.get("state")!;
+      const cbRes = await obsApp.fetch(
+        new Request(`https://shiori.example.com/callback?code=gh_code&state=${encodeURIComponent(ghState)}`, {
+          headers: { Cookie: extractCookie(aRes) },
+        }),
+      );
+      const code = new URL(cbRes.headers.get("location")!).searchParams.get("code")!;
+      const tokRes = await obsApp.fetch(
+        new Request("https://shiori.example.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            client_id,
+            redirect_uri: "http://127.0.0.1:4321/cb",
+            code_verifier: verifier,
+          }),
+        }),
+      );
+      const { access_token } = (await tokRes.json()) as { access_token: string };
+
+      const call = async (name: string, args: Record<string, unknown> = {}) => {
+        const res = await obsApp.fetch(
+          new Request("https://shiori.example.com/mcp", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${access_token}`,
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+            },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+          }),
+        );
+        const raw = await res.text();
+        const ct = res.headers.get("content-type") ?? "";
+        const jsonText = ct.includes("text/event-stream")
+          ? raw
+              .split("\n")
+              .filter((l) => l.startsWith("data: "))
+              .map((l) => l.slice(6))
+              .pop() ?? ""
+          : raw;
+        return (JSON.parse(jsonText) as { result: { content: { text: string }[] } }).result.content[0].text;
+      };
+
+      // Trigger a compaction that fails with 429
+      await call("memory_note", { content: "First memory entry" });
+      await call("memory_note", { content: "Second memory entry" });
+      await obsApp.compactor.drain();
+
+      // /health stays ok:true (so Coolify doesn't kill container) but flags degraded:true
+      const health = (await (await obsApp.fetch(new Request("https://shiori.example.com/health"))).json()) as {
+        ok: boolean;
+        degraded: boolean;
+        openAlerts: number;
+        pendingCompactions: number;
+      };
+      expect(health.ok).toBe(true);
+      expect(health.degraded).toBe(true);
+      expect(health.openAlerts).toBeGreaterThan(0);
+      expect(health.pendingCompactions).toBe(1);
+
+      // /admin/status shows rateLimitCount and openAlerts
+      const statusRes = await obsApp.fetch(
+        new Request("https://shiori.example.com/admin/status", { headers: { Authorization: "Bearer obs-secret" } }),
+      );
+      expect(statusRes.status).toBe(200);
+      const status = (await statusRes.json()) as {
+        degraded: boolean;
+        memorySummary: { stats: { rateLimitCount: number; lastRateLimited: boolean }; pendingCompactions: number };
+        openAlerts: { source: string }[];
+      };
+      expect(status.degraded).toBe(true);
+      expect(status.memorySummary.stats.rateLimitCount).toBeGreaterThan(0);
+      expect(status.memorySummary.stats.lastRateLimited).toBe(true);
+      expect(status.openAlerts.some((a) => a.source === "memory-summary")).toBe(true);
+
+      // memory_wake surfaces warning to the agent
+      const woke = await call("memory_wake");
+      expect(woke).toContain("[Shiori Warning]");
+      expect(woke).toContain("429 rate limit / quota");
+
+      // Webhook was called once (throttled across retries)
+      expect(webhookPayloads).toHaveLength(1);
+
+      // Recovery: allow summarizer to succeed, re-trigger compactor
+      failSummary = false;
+      obsApp.compactor.trigger();
+      await obsApp.compactor.drain();
+
+      const wokeAfter = await call("memory_wake");
+      expect(wokeAfter).not.toContain("[Shiori Warning]");
+
+      // Manual resolve endpoint works
+      const resolveRes = await obsApp.fetch(
+        new Request("https://shiori.example.com/admin/alerts/resolve", {
+          method: "POST",
+          headers: { Authorization: "Bearer obs-secret" },
+        }),
+      );
+      expect(resolveRes.status).toBe(200);
+    } finally {
+      await obsApp.close();
+      fs.rmSync(obsDir, { recursive: true, force: true });
+    }
+  });
 });

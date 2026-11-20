@@ -28,6 +28,7 @@ export interface AppConfig {
   memorySummaryApiKey: string;
   memorySummaryModel: string;
   memorySummaryBaseUrl: string;
+  alertWebhookUrl: string;
   gitRemoteUrl: string;
   gitAuthorName: string;
   gitAuthorEmail: string;
@@ -111,6 +112,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     memorySummaryApiKey,
     memorySummaryModel: env.MEMORY_SUMMARY_MODEL?.trim() || defaultSummaryModel,
     memorySummaryBaseUrl: (env.MEMORY_SUMMARY_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, ""),
+    alertWebhookUrl: env.ALERT_WEBHOOK_URL?.trim() || "",
     gitRemoteUrl: env.GIT_REMOTE_URL?.trim() || "",
     gitAuthorName: env.GIT_AUTHOR_NAME?.trim() || "Shiori",
     gitAuthorEmail: env.GIT_AUTHOR_EMAIL?.trim() || "shiori@localhost",

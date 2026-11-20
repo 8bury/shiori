@@ -10,6 +10,7 @@ import { MemoryCompactor } from "./memory/compactor.js";
 import { buildMemoryInstructions } from "./memory/prompt.js";
 import { createSummarizer, type MemorySummarizer } from "./memory/summarizer.js";
 import { MemoryStore } from "./memory/tree.js";
+import { Observability, observeEmbedder, observeSummarizer } from "./observability.js";
 import { IndexQueue } from "./queue.js";
 import { runReconcile } from "./reconcile/reconcile.js";
 import type { Mode, Report } from "./reconcile/types.js";
@@ -52,8 +53,9 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
   const keywords = new SqliteKeywords(db);
   const vectors = new SqliteVectorIndex(db);
   const alerts = new SqliteAlerts(db);
-  const embedder = options.embedder ?? createEmbedder(config);
-  const summarizer = options.summarizer ?? createSummarizer(config, options.fetcher);
+  const observability = new Observability(alerts, config.alertWebhookUrl, config.serverName, options.fetcher);
+  const embedder = observeEmbedder(options.embedder ?? createEmbedder(config), observability);
+  const summarizer = observeSummarizer(options.summarizer ?? createSummarizer(config, options.fetcher), observability);
   const autoCompact = !summarizer.disabled;
   const memory = new MemoryStore(db, config.memoryWakeLines, path.join(config.dataDir, "memory.log"), autoCompact);
   const compactor = new MemoryCompactor(memory, summarizer, alerts, options.queueDelayMultiplier ?? 1000);
@@ -153,7 +155,11 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
         inputSchema: { lines: z.number().int().min(8).max(500).optional() },
         annotations: READ_ONLY,
       },
-      async ({ lines }) => text(memory.wake(lines)),
+      async ({ lines }) => {
+        const woke = memory.wake(lines);
+        const warn = observability.wakeWarning();
+        return text(warn ? `${woke}\n\n${warn}` : woke);
+      },
     );
 
     server.registerTool(
@@ -346,8 +352,13 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
     const { pathname } = url;
 
     if (pathname === "/health" && request.method === "GET") {
+      const openAlerts = alerts.countOpen();
+      const pendingCompactions = memory.countPendingMerges();
       return Response.json({
         ok: true,
+        degraded: openAlerts > 0,
+        openAlerts,
+        pendingCompactions,
         embeddingProvider: config.embeddingProvider,
         memorySummaryProvider: config.memorySummaryProvider,
         autoCompact,
@@ -428,6 +439,53 @@ export async function createApp(config: AppConfig, options: CreateAppOptions = {
       const message = memory.forget(range);
       if (autoCompact) compactor.trigger();
       return Response.json({ message });
+    }
+
+    if (pathname === "/admin/status" && request.method === "GET") {
+      if (!hasBearer(request, config.adminSecret)) return new Response("Not found", { status: 404 });
+      const openAlerts = alerts.listOpen(50);
+      return Response.json(
+        {
+          ok: openAlerts.length === 0,
+          degraded: openAlerts.length > 0,
+          embedding: {
+            provider: config.embeddingProvider,
+            model: config.embeddingModel,
+            disabled: Boolean(embedder.disabled),
+            stats: observability.getStats("embedding"),
+          },
+          memorySummary: {
+            provider: config.memorySummaryProvider,
+            model: config.memorySummaryModel,
+            autoCompact,
+            pendingCompactions: memory.countPendingMerges(),
+            totalMemories: memory.count(),
+            stats: observability.getStats("memory-summary"),
+          },
+          openAlerts,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+
+    if (pathname === "/admin/alerts/resolve" && request.method === "POST") {
+      if (!hasBearer(request, config.adminSecret)) return new Response("Not found", { status: 404 });
+      const idParam = url.searchParams.get("id");
+      const sourceParam = url.searchParams.get("source");
+      let resolved = 0;
+      if (idParam && /^\d+$/.test(idParam)) {
+        resolved = alerts.resolveById(Number(idParam));
+      } else if (
+        sourceParam === "dlq" ||
+        sourceParam === "reconcile" ||
+        sourceParam === "embedding" ||
+        sourceParam === "memory-summary"
+      ) {
+        resolved = alerts.resolveBySource(sourceParam);
+      } else {
+        resolved = alerts.resolveAll();
+      }
+      return Response.json({ resolved });
     }
 
     return new Response("Not found", { status: 404 });

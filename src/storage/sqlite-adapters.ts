@@ -167,14 +167,56 @@ export class SqliteReconcileIndex implements ReconcileIndex {
   }
 }
 
+export type AlertSource = "dlq" | "reconcile" | "embedding" | "memory-summary";
+
+export interface AlertRow {
+  id: number;
+  source: AlertSource;
+  body: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 export class SqliteAlerts {
   constructor(private readonly db: DatabaseSync) {}
 
-  add(source: "dlq" | "reconcile", body: string) {
+  add(source: AlertSource, body: string) {
     this.db.prepare("INSERT INTO alerts (source, body, created_at) VALUES (?, ?, ?)").run(source, body, new Date().toISOString());
   }
 
+  listOpen(limit = 50): AlertRow[] {
+    return this.db
+      .prepare("SELECT id, source, body, created_at, resolved_at FROM alerts WHERE resolved_at IS NULL ORDER BY id DESC LIMIT ?")
+      .all(limit) as unknown as AlertRow[];
+  }
+
+  countOpen(): number {
+    const row = this.db.prepare("SELECT COUNT(*) as c FROM alerts WHERE resolved_at IS NULL").get() as { c: number };
+    return Number(row.c);
+  }
+
+  resolveBySource(source: AlertSource): number {
+    const res = this.db
+      .prepare("UPDATE alerts SET resolved_at = ? WHERE source = ? AND resolved_at IS NULL")
+      .run(new Date().toISOString(), source);
+    return Number(res.changes);
+  }
+
+  resolveById(id: number): number {
+    const res = this.db
+      .prepare("UPDATE alerts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL")
+      .run(new Date().toISOString(), id);
+    return Number(res.changes);
+  }
+
+  resolveAll(): number {
+    const res = this.db
+      .prepare("UPDATE alerts SET resolved_at = ? WHERE resolved_at IS NULL")
+      .run(new Date().toISOString());
+    return Number(res.changes);
+  }
+
   resolveDlq() {
-    this.db.prepare("UPDATE alerts SET resolved_at = ? WHERE source = 'dlq' AND resolved_at IS NULL").run(new Date().toISOString());
+    this.resolveBySource("dlq");
   }
 }

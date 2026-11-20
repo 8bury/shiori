@@ -153,6 +153,20 @@ export class MemoryStore {
     return summary !== null ? `#${lo}-${hi} ${summary}` : null;
   }
 
+  /** Counts how many complete power-of-2 pairs are currently missing a summary. */
+  countPendingMerges(): number {
+    const total = this.count();
+    if (total < 2) return 0;
+    const keys = this.loadSummaryKeys();
+    let missing = 0;
+    for (let size = 2; size <= total; size *= 2) {
+      for (let lo = 0; lo + size - 1 < total; lo += size) {
+        if (!keys.has(`${lo}-${lo + size - 1}`)) missing += 1;
+      }
+    }
+    return missing;
+  }
+
   /** Finds the next complete power-of-2 pair missing a summary, bottom-up, using one index scan. */
   nextPendingMerge(): PendingMerge | null {
     const total = this.count();

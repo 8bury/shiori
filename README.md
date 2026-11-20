@@ -103,6 +103,8 @@ Protected by `Authorization: Bearer <ADMIN_SECRET>`:
 - `DELETE /admin/grants/<id>`: revoke one client grant
 - `POST /admin/reconcile`: reconcile the search index with Git (`?mode=rebuild` for a full rebuild)
 - `POST /admin/memory/forget`: drop a bad `#lo-hi` summary (and ancestors) so it rebuilds from the raw log (`{"range":"0-1"}`)
+- `GET /admin/status`: inspect embedding & memory-summary health, rate-limit counters, pending compactions, and open alerts
+- `POST /admin/alerts/resolve`: clear open alerts (optional `?id=<n>` or `?source=embedding|memory-summary|dlq|reconcile`)
 
 ## Credits & License
 
